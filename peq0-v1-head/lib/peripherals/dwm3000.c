@@ -38,6 +38,71 @@ void dwm3000_reset_pin_only(int rst)
     reset_DWIC();
 }
 
+esp_err_t dwm3000_reconfigure_recover(const void *uwb_config,
+                                      const void *tx_config,
+                                      uint16_t tx_ant_dly, uint16_t rx_ant_dly)
+{
+    /* Put the transceiver into a known-idle state first. On this driver
+     * dwt_forcetrxoff() only issues CMD_TXRXOFF if not already idle — it does
+     * NOT reset the receiver, so the real work is the dwt_configure re-cal. */
+    dwt_forcetrxoff();
+
+    /* Force the next dwt_configure() to re-measure die temperature and
+     * recalibrate PLL/RX for it. This is the fix for "works then degrades"
+     * thermal drift: PGF/RX cal must re-run after ~20 °C of change. */
+    dwt_setpllcaltemperature(TEMP_INIT);   /* -127 -> read on-chip sensor */
+
+    if (dwt_configure((dwt_config_t *)uwb_config) != DWT_SUCCESS) {
+        ESP_LOGW(TAG, "recover: dwt_configure (PGF/RX cal) failed");
+        return ESP_FAIL;
+    }
+
+    /* Re-apply everything dwt_configure does not: TX RF, antenna delays,
+     * LNA/PA. These are lost/irrelevant across a reconfigure but must be
+     * restored for ranging. */
+    dwt_configuretxrf((dwt_txconfig_t *)tx_config);
+    dwt_settxantennadelay(tx_ant_dly);
+    dwt_setrxantennadelay(rx_ant_dly);
+    dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
+
+    ESP_LOGW(TAG, "recover: reconfigured + recalibrated (PLL cal T=%d C)",
+             (int)dwt_getpllcaltemperature());
+    return ESP_OK;
+}
+
+esp_err_t dwm3000_hard_recover(void)
+{
+    dwt_forcetrxoff();
+    reset_DWIC();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (dwt_probe((struct dwt_probe_s *)&dw3000_probe_interf) != DWT_SUCCESS) {
+        ESP_LOGE(TAG, "hard_recover: dwt_probe failed");
+        return ESP_FAIL;
+    }
+    int waited_ms = 0;
+    while (!dwt_checkidlerc()) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        if ((waited_ms += 2) > 200) {
+            ESP_LOGE(TAG, "hard_recover: IDLE_RC timeout");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+    if (dwt_initialise(DWT_DW_INIT) != DWT_SUCCESS) {
+        ESP_LOGE(TAG, "hard_recover: dwt_initialise failed");
+        return ESP_FAIL;
+    }
+    port_set_dw_ic_spi_fastrate();
+    ESP_LOGW(TAG, "hard_recover: re-initialised (caller must reconfigure)");
+    return ESP_OK;   /* caller must follow with dwm3000_reconfigure_recover() */
+}
+
+float dwm3000_read_temp_c(void)
+{
+    uint16_t raw = dwt_readtempvbat();          /* [15:8]=temp, [7:0]=vbat */
+    return dwt_convertrawtemperature((uint8_t)(raw >> 8));
+}
+
 
 esp_err_t dwm3000_init(int mosi, int miso, int sclk, int cs, int rst)
 {

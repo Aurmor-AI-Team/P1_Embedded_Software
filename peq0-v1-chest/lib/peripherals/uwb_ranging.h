@@ -8,9 +8,45 @@
 extern "C" {
 #endif
 
+/* TDMA DS-TWR with main-broadcast beacon synchronisation.
+ *
+ * One ROUND is:
+ *   t=0       Main broadcasts Beacon
+ *   t=slot×i  Peripheral i sends Poll  (scheduled off beacon RX timestamp)
+ *             Main sends Response
+ *             Peripheral i sends Final (carries 3 timestamps + IMU)
+ *             Main computes distance + extracts IMU for slot i
+ *   ... for i = 1..UWB_MAX_PERIPHERALS
+ *
+ * Why the beacon: each peripheral schedules its Poll using
+ * dwt_setdelayedtrxtime referenced to the DW3000's hardware RX timestamp
+ * of the beacon — the same 499.2 MHz clock that DS-TWR already cancels.
+ * Host-clock drift between boards becomes irrelevant; peripherals re-sync
+ * to the main every round. */
+
+#define UWB_MAX_PERIPHERALS  15
+
+/* Slot timing. ONE slot must fit: Response delay (6 ms) + Final delay
+ * (6 ms) + frame air time (~1 ms) + guard (2 ms) = ~15 ms. Decrease only
+ * after observing low "late/cancelled" rates in real data. Increase if
+ * you see Poll-listen misses caused by neighboring slots bleeding in. */
+#define UWB_SLOT_WIDTH_MS      15
+#define UWB_ROUND_GUARD_MS     15   /* trailing pad after last slot      */
+
+/* Total round duration. With 15 peripherals + beacon + guard:
+ *   beacon(slot 0) + 15 slots + guard = 16 × 15 + 15 = 255 ms ≈ 3.9 Hz   */
+#define UWB_ROUND_PERIOD_MS    \
+    ((UWB_MAX_PERIPHERALS + 1) * UWB_SLOT_WIDTH_MS + UWB_ROUND_GUARD_MS)
+
+/* Roles for the 3-message DS-TWR exchange under TDMA scheduling.
+ *
+ *   MAIN        broadcasts beacon, then ranges each peripheral slot in
+ *               turn. The result for each peripheral lands here.
+ *   PERIPHERAL  receives beacon, waits its assigned slot offset, then
+ *               sends Poll and Final. Carries its IMU in the Final. */
 typedef enum {
-    UWB_ROLE_INITIATOR,
-    UWB_ROLE_RESPONDER,
+    UWB_ROLE_MAIN,
+    UWB_ROLE_PERIPHERAL,
 } uwb_role_t;
 
 typedef struct {
@@ -21,40 +57,51 @@ typedef struct {
     int64_t timestamp_us;
     bool    valid;
 
-    /* Peer (responder) IMU snapshot, carried inside the Report frame.
-     * Only meaningful on the initiator side, after a successful range
-     * cycle. peer_imu_valid is false on the responder. */
+    /* Peer (peripheral) IMU snapshot, carried inside the Final frame.
+     * Only meaningful on the main side, after a successful range cycle.
+     * peer_imu_valid is false on the peripheral. */
     lsm6_sample_t peer_imu;
     bool          peer_imu_valid;
 } uwb_range_result_t;
 
-/* Initialise UWB. For UWB_ROLE_RESPONDER, the responder's own address
- * suffix is 'A'..'I' for boards WA..WI. Pass 0 to use the default 'A'.
- * Initiator ignores responder_addr_suffix. */
+/* Initialise UWB.
+ *
+ * For UWB_ROLE_PERIPHERAL, the peripheral's own address suffix is
+ *   'A'..'O' for boards WA..WO  (15 peripherals max).
+ * The suffix doubles as the slot index: 'A' = slot 1, 'B' = slot 2, ...,
+ * 'O' = slot 15. Slot 0 is the beacon (main TX only). Pass 0 to use the
+ * default 'A'. Main ignores peripheral_addr_suffix. */
 esp_err_t uwb_init(uwb_role_t role,
-                   char responder_addr_suffix,
+                   char peripheral_addr_suffix,
                    int mosi, int miso, int sclk, int cs, int rst);
 
-/* Performs one DS-TWR cycle.
+/* On MAIN:
+ *   Performs one full TDMA ROUND. Broadcasts the beacon, then sweeps the
+ *   15 peripheral slots; for each slot, listens for Poll, sends Response,
+ *   receives Final, computes distance. Fills results[0..UWB_MAX_PERIPHERALS-1]
+ *   so results[i] is the outcome for the peripheral whose suffix = 'A'+i.
+ *   Empty / non-responding slots leave results[i].valid = false.
+ *   Call this in a tight loop with no extra delay — the round itself
+ *   provides the pacing.
  *
- * On the initiator, peer_addr_suffix selects which responder to talk to
- * ('A'..'I' for WA..WI). The responder ignores these parameters.
+ * On PERIPHERAL:
+ *   Performs one cycle. Waits for the beacon (blocks up to ~UWB_ROUND_PERIOD_MS),
+ *   then schedules its Poll at its assigned slot offset, completes the
+ *   exchange. Writes results[0] only (the peripheral knows only its own
+ *   cycle outcome). results[1..] are untouched. No distance is computed
+ *   here (it lives on main); results[0].valid means "Final sent OK".
+ *   Call in a tight loop — the beacon wait IS the pacing.
  *
- * Four-frame exchange:
- *   Initiator:  Poll TX -> Response RX -> Final TX (with timestamps) -> Report RX
- *   Responder:  Poll RX (only if addressed to us) -> Response TX -> Final RX
- *                -> compute DS-TWR ToF -> Report TX (with distance + IMU)
+ * `results` must be an array of at least UWB_MAX_PERIPHERALS entries on
+ * MAIN and at least 1 entry on PERIPHERAL.
  *
- * Returns ESP_OK whether or not the cycle completed end-to-end — check
- * result->valid for that. Returns an error only on driver/SPI failure. */
-esp_err_t uwb_perform_ranging(char peer_addr_suffix, uwb_range_result_t *result);
+ * Returns ESP_OK unless a driver/SPI fault occurs. Individual slot
+ * outcomes live in results[i].valid. */
+esp_err_t uwb_perform_round(uwb_range_result_t *results);
 
-/* Publish the local IMU sample so the responder can embed it in the next
- * Report frame. Should be called from whatever task produces IMU samples
- * (e.g. the imu timer callback in main.cpp). Safe to call concurrently
- * with uwb_perform_ranging — uses an internal spinlock.
- *
- * Has no effect on the initiator. */
+/* Publish the local IMU sample so the peripheral can embed it in the
+ * next Final frame. Safe to call concurrently with uwb_perform_round.
+ * Has no effect on the main node. */
 void uwb_publish_local_imu(const lsm6_sample_t *sample);
 
 /* Calibration offset subtracted from raw distance (meters). Leave at 0

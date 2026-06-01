@@ -60,6 +60,7 @@ uint32_t port_GetEXT_IRQStatus(void);
 uint32_t port_CheckEXT_IRQ(void);
 void     process_deca_irq(void);
 void port_set_dw_ic_spi_fastrate(void);
+esp_err_t port_enable_dw3000_irq(void);
 
 #ifdef __cplusplus
 }

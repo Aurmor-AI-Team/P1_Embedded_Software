@@ -28,8 +28,8 @@ static const char *TAG = "main";
 // Set this per-board: one as INITIATOR, the others as RESPONDER.
 // Flash the same firmware to all boards and change MY_UWB_ROLE plus,
 // for responders, MY_RESPONDER_SUFFIX ('A'..'I' for up to 9 responders).
-#define MY_UWB_ROLE         UWB_ROLE_INITIATOR  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
-#define MY_RESPONDER_SUFFIX 'A'                 // 'A'..'I', ignored for initiator
+#define MY_UWB_ROLE         UWB_ROLE_RESPONDER  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+#define MY_RESPONDER_SUFFIX 'B'                 // 'A'..'I', ignored for initiator
 
 // Initiator: which responders to range against, in cycle order. List
 // only the suffix character; the full address is "W<suffix>". The

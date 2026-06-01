@@ -25,62 +25,74 @@ static const char *TAG = "main";
 #define PIN_SDA  22
 #define PIN_SCL  23
 
-// Set this per-board: one as INITIATOR, the others as RESPONDER.
+// Set this per-board: one as MAIN, the others as PERIPHERAL.
 // Flash the same firmware to all boards and change MY_UWB_ROLE plus,
-// for responders, MY_RESPONDER_SUFFIX ('A'..'I' for up to 9 responders).
-#define MY_UWB_ROLE         UWB_ROLE_INITIATOR  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
-#define MY_RESPONDER_SUFFIX 'A'                 // 'A'..'I', ignored for initiator
-
-// Initiator: which responders to range against, in cycle order. List
-// only the suffix character; the full address is "W<suffix>". The
-// initiator round-robins through this list, one peer per cycle.
+// for peripherals, MY_PERIPHERAL_SUFFIX ('A'..'I' for up to 9 peripherals).
 //
-// Set this to the list of responders you've actually flashed. Unflashed
-// suffixes will just time out and be marked stale — harmless but wasteful
-// of cycle time.
-// Initiator = Head
-// A = Chest/Waist
-// B = Left Elbow (above elbow)
-// C = Right Elbow (above elbow)
-// D = Left Wrist
-// E = Right Wrist
-// F = Left Knee (above knee)
-// G = Right Knee (above knee)
-// H = Left ankle
-// I = Right ankle
-static const char s_initiator_peer_list[] = {
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
-};
-#define INITIATOR_PEER_COUNT (sizeof(s_initiator_peer_list) / sizeof(s_initiator_peer_list[0]))
+// 3-message DS-TWR: the PERIPHERAL sends the first message (Poll) and the
+// last (Final); the MAIN replies (Response) and computes the distance, so
+// the result lands on the MAIN node.
+#define MY_UWB_ROLE          UWB_ROLE_MAIN  // UWB_ROLE_PERIPHERAL or UWB_ROLE_MAIN
+#define MY_PERIPHERAL_SUFFIX 'A'            // 'A'..'I', ignored for main
 
-// Sampling and reporting rates. With 9 peers, UWB_RANGE_HZ is the
-// *total* round-robin rate; per-peer rate is UWB_RANGE_HZ / N_PEERS.
-// 30 Hz total / 9 peers = ~3.3 Hz per peer.
+// Main: which peripherals to range against, in cycle order. List only the
+// suffix character; the full address is "W<suffix>". The main round-robins
+// through this list, one peer per cycle, waiting for each peripheral's Poll.
+//
+// TDMA SCHEDULING:
+//   The main broadcasts a beacon at the start of each round; each
+//   peripheral schedules its Poll at its assigned slot offset from the
+//   beacon RX timestamp (slot = suffix - 'A' + 1, so 'A' = slot 1, etc).
+//   Slots are non-overlapping by construction — peripherals cannot
+//   collide on air as long as they each have a unique suffix.
+//
+//   Because slots are anchored to the DW3000's hardware RX timestamp of
+//   the beacon (the same 499.2 MHz clock DS-TWR cancels), host-clock
+//   drift between boards does NOT accumulate. Peripherals re-sync to the
+//   main every round.
+//
+// Assign each peripheral one of suffixes 'A'..'O' (15 max). Unassigned
+// slots time out at the main (~10 ms per empty slot) and are marked
+// stale in the per-peer table — harmless but reduces useful round rate.
+//
+// Main = Head
+// A = Chest/Waist            I = Right ankle
+// B = Left Elbow             J = (spare)
+// C = Right Elbow            K = (spare)
+// D = Left Wrist             L = (spare)
+// E = Right Wrist            M = (spare)
+// F = Left Knee              N = (spare)
+// G = Right Knee             O = (spare)
+// H = Left ankle
+
+// Sampling and reporting rates. The UWB round rate is fixed by TDMA
+// geometry (UWB_ROUND_PERIOD_MS in uwb_ranging.h), not by a configurable
+// Hz value here. At default 15 ms slots × 16 phases (beacon + 15
+// peripherals) + 15 ms guard = 255 ms per round ≈ 3.9 Hz per peripheral.
+// If you need more rate, shrink UWB_SLOT_WIDTH_MS in the header (at the
+// cost of less jitter tolerance).
 #define IMU_SAMPLE_HZ     200
 #define IMU_PRINT_HZ      10
-#define UWB_RANGE_HZ      30
 
 #define IMU_SAMPLE_PERIOD_US (1000000 / IMU_SAMPLE_HZ)
 #define IMU_PRINT_PERIOD_MS  (1000 / IMU_PRINT_HZ)
-#define UWB_PERIOD_MS        (1000 / UWB_RANGE_HZ)
 
 // ---------------------------------------------------------------------------
-// Per-peer state table (initiator only).
+// Per-peer state table (main only).
 //
-// Indexed by position in s_initiator_peer_list, NOT by ASCII value of
-// the suffix. So peer slot 0 holds whatever responder is at
-// s_initiator_peer_list[0], etc.
+// Indexed by slot index 0..UWB_MAX_PERIPHERALS-1, where index i
+// corresponds to peripheral suffix 'A' + i. So index 0 is always 'A',
+// index 14 is always 'O'.
 //
 // Each slot holds the most recent ranging result for that peer, when it
 // was captured, and a small failure counter. Stale slots (no update in
-// PEER_STALE_MS) are flagged in the snapshot so consumers can ignore
-// them.
+// PEER_STALE_MS) are flagged in the snapshot so consumers can ignore them.
 //
 // Protected by a portMUX_TYPE spinlock. Contention is low (the UWB task
-// writes one slot per round-robin cycle, the print task reads everything
+// writes one slot per slot exchange, the print task reads everything
 // once per print interval), and a spinlock never blocks.
 // ---------------------------------------------------------------------------
-#define PEER_STALE_MS  500   // Slot is stale if no update in this many ms
+#define PEER_STALE_MS  2000   // ~8 rounds at 4 Hz round rate
 
 typedef struct {
     uwb_range_result_t result;       // distance + peer_imu (when .valid)
@@ -89,18 +101,19 @@ typedef struct {
     uint32_t           miss_count;   // Cumulative consecutive missed cycles
 } peer_state_t;
 
-static peer_state_t   s_peer_state[INITIATOR_PEER_COUNT] = {};
+static peer_state_t   s_peer_state[UWB_MAX_PERIPHERALS] = {};
 static portMUX_TYPE   s_peer_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// Responder-side shared state: this device's last "range from initiator".
-// Single slot (one initiator, one responder = one relationship). The
-// responder cycle writes this; the print task on the responder reads it.
-// Initiator does not use s_self_range.
+// Peripheral-side shared state: this device's link status to the main.
+// Single slot (one main, one peripheral = one relationship). The
+// peripheral cycle writes this (distance is always 0 — the main computes
+// the real distance); the print task on the peripheral reads it as a
+// liveness flag. Main does not use s_self_range.
 static uwb_range_result_t s_self_range = {};
 static portMUX_TYPE       s_self_lock  = portMUX_INITIALIZER_UNLOCKED;
 
 static inline void peer_state_publish(size_t idx, const uwb_range_result_t *r) {
-    if (idx >= INITIATOR_PEER_COUNT) return;
+    if (idx >= UWB_MAX_PERIPHERALS) return;
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_peer_lock);
     s_peer_state[idx].result     = *r;
@@ -111,7 +124,7 @@ static inline void peer_state_publish(size_t idx, const uwb_range_result_t *r) {
 }
 
 static inline void peer_state_record_miss(size_t idx) {
-    if (idx >= INITIATOR_PEER_COUNT) return;
+    if (idx >= UWB_MAX_PERIPHERALS) return;
     portENTER_CRITICAL(&s_peer_lock);
     s_peer_state[idx].miss_count++;
     portEXIT_CRITICAL(&s_peer_lock);
@@ -119,13 +132,13 @@ static inline void peer_state_record_miss(size_t idx) {
 
 static inline void peer_state_snapshot(peer_state_t *out) {
     portENTER_CRITICAL(&s_peer_lock);
-    for (size_t i = 0; i < INITIATOR_PEER_COUNT; i++) {
+    for (size_t i = 0; i < UWB_MAX_PERIPHERALS; i++) {
         out[i] = s_peer_state[i];
     }
     portEXIT_CRITICAL(&s_peer_lock);
 }
 
-// Convenience for responder side — same pattern but a single slot.
+// Convenience for peripheral side — same pattern but a single slot.
 static inline void self_range_publish(const uwb_range_result_t *r) {
     portENTER_CRITICAL(&s_self_lock);
     s_self_range = *r;
@@ -144,6 +157,85 @@ static inline uwb_range_result_t self_range_snapshot(void) {
     r = s_self_range;
     portEXIT_CRITICAL(&s_self_lock);
     return r;
+}
+
+/* ============================================================================
+ * Observational ranging diagnostics — LOGS ONLY, never touches the radio.
+ *
+ * Captures the timing signature of failures so we can distinguish cadence
+ * desync from chip faults: per-peer success/miss counts, current miss streak,
+ * worst streak, time since last success, and the actual loop period (to catch
+ * vTaskDelayUntil free-running). Dumps a summary every DIAG_DUMP_PERIOD_MS.
+ * Remove once the root cause is found. */
+#define DIAG_DUMP_PERIOD_MS  5000
+
+typedef struct {
+    uint32_t ok;                 /* total successes */
+    uint32_t miss;               /* total misses */
+    uint32_t cur_streak;         /* current consecutive misses */
+    uint32_t worst_streak;       /* worst consecutive misses seen */
+    int64_t  last_ok_us;         /* timestamp of last success (0 = never) */
+    int64_t  worst_gap_us;       /* longest observed gap between successes */
+} diag_peer_t;
+
+static diag_peer_t s_diag[UWB_MAX_PERIPHERALS];
+static int64_t     s_diag_last_dump_us = 0;
+static int64_t     s_diag_last_cycle_us = 0;
+static int64_t     s_diag_max_period_us = 0;   /* worst loop period since last dump */
+static int64_t     s_diag_min_period_us = 0;
+
+/* Call once per slot, right after uwb_perform_round returns on the main.
+ * idx = slot index (0..UWB_MAX_PERIPHERALS-1, == suffix - 'A').
+ * success = results[idx].valid. */
+static void diag_record(size_t idx, bool success)
+{
+    int64_t now = esp_timer_get_time();
+
+    /* Loop period tracking — detects cadence collapse / free-running. */
+    if (s_diag_last_cycle_us != 0) {
+        int64_t period = now - s_diag_last_cycle_us;
+        if (period > s_diag_max_period_us) s_diag_max_period_us = period;
+        if (s_diag_min_period_us == 0 || period < s_diag_min_period_us) {
+            s_diag_min_period_us = period;
+        }
+    }
+    s_diag_last_cycle_us = now;
+
+    if (idx >= UWB_MAX_PERIPHERALS) return;
+    diag_peer_t *p = &s_diag[idx];
+
+    if (success) {
+        if (p->last_ok_us != 0) {
+            int64_t gap = now - p->last_ok_us;
+            if (gap > p->worst_gap_us) p->worst_gap_us = gap;
+        }
+        p->last_ok_us = now;
+        p->ok++;
+        p->cur_streak = 0;
+    } else {
+        p->miss++;
+        p->cur_streak++;
+        if (p->cur_streak > p->worst_streak) p->worst_streak = p->cur_streak;
+    }
+
+    /* Periodic dump. */
+    if (now - s_diag_last_dump_us >= (int64_t)DIAG_DUMP_PERIOD_MS * 1000) {
+        s_diag_last_dump_us = now;
+        printf("# DIAG period(ms) min=%.1f max=%.1f | per-peer ok/miss streak(cur/worst) ageOK(ms) worstGap(ms)\n",
+               s_diag_min_period_us / 1000.0, s_diag_max_period_us / 1000.0);
+        for (size_t i = 0; i < UWB_MAX_PERIPHERALS; i++) {
+            diag_peer_t *q = &s_diag[i];
+            double age_ms = (q->last_ok_us == 0) ? -1.0
+                          : (now - q->last_ok_us) / 1000.0;
+            printf("#   W%c: ok=%lu miss=%lu streak=%lu/%lu ageOK=%.0f worstGap=%.0f\n",
+                   (char)('A' + (i)),
+                   (unsigned long)q->ok, (unsigned long)q->miss,
+                   (unsigned long)q->cur_streak, (unsigned long)q->worst_streak,
+                   age_ms, q->worst_gap_us / 1000.0);
+        }
+        s_diag_max_period_us = 0;
+        s_diag_min_period_us = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +258,8 @@ static void imu_timer_cb(void *arg)
     lsm6_sample_t s;
     if (lsm6_read_sample(&s) != ESP_OK) return;
 
-    // Publish to the UWB module so the responder can embed the freshest
-    // sample in its next Report frame. On the initiator this is harmless
+    // Publish to the UWB module so the peripheral can embed the freshest
+    // sample in its next Final frame. On the main this is harmless
     // (the function checks role internally).
     uwb_publish_local_imu(&s);
 
@@ -265,87 +357,128 @@ static void imu_print_task(void *arg)
             continue;
         }
 
-        // Build the range column. On the responder, this is just the
-        // distance to the (one and only) initiator. On the initiator, we
-        // pick a peer to show on the main line and dump a per-peer
-        // summary line below (rotating which peer's IMU we detail, so
-        // every peer gets shown roughly once per N print intervals).
+        // Build the range column. On the MAIN, distances come from the
+        // per-peer grid printed below, so the main line just shows "---".
+        // On the PERIPHERAL there is no local distance (the main computes
+        // it), so we show a link indicator instead: "link" when recent
+        // cycles are completing, "---" when they aren't.
         char range_str[16];
-        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
-            // For the main line: show the most recently-updated peer's
-            // distance, or "---" if no peer has reported in.
+        if (MY_UWB_ROLE == UWB_ROLE_MAIN) {
+            // For the main line: the per-peer grid below carries distances.
             snprintf(range_str, sizeof(range_str), "   ---");
         } else {
             uwb_range_result_t sr = self_range_snapshot();
-            if (sr.valid) snprintf(range_str, sizeof(range_str), "%7.3f", sr.distance_m);
+            if (sr.valid) snprintf(range_str, sizeof(range_str), "   link");
             else          snprintf(range_str, sizeof(range_str), "   ---");
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
         const lsm6_sample_t &p = window_peak_sample;
-        printf("%-10lld | %+8.3f %+8.3f %+8.3f | "
-               "%+8.2f %+8.2f %+8.2f | "
-               "%+9.2f %+9.2f %+9.2f | %5.1f | %5.2fg | %6.2fg  | %s\n",
-               now_ms,
-               p.ax_g, p.ay_g, p.az_g,
-               p.hx_g, p.hy_g, p.hz_g,
-               p.gx_dps, p.gy_dps, p.gz_dps,
-               p.temp_c,
-               window_peak_g, all_time_peak_g,
-               range_str);
+        // printf("%-10lld | %+8.3f %+8.3f %+8.3f | "
+        //        "%+8.2f %+8.2f %+8.2f | "
+        //        "%+9.2f %+9.2f %+9.2f | %5.1f | %5.2fg | %6.2fg  | %s\n",
+        //        now_ms,
+        //        p.ax_g, p.ay_g, p.az_g,
+        //        p.hx_g, p.hy_g, p.hz_g,
+        //        p.gx_dps, p.gy_dps, p.gz_dps,
+        //        p.temp_c,
+        //        window_peak_g, all_time_peak_g,
+        //        range_str);
 
-        // Initiator: dump compact all-peer distance grid every ~500 ms
-        // (5 print intervals), plus rotate through peers' IMU detail one
-        // per print iteration so every peer's IMU shows up over time.
-        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
-            static int peer_grid_counter = 0;
-            static size_t peer_rotate_idx = 0;
+        // Main: dump full 16-row node table every ~500 ms (5 print
+        // intervals). One row for the main itself, plus one for each of
+        // the 15 peripherals A..O. Empty cells when a peripheral has not
+        // reported anything fresh (age > PEER_STALE_MS or never seen).
+        // Counters stay visible regardless, so a row with 0 ok / N miss
+        // tells you "this peripheral is silent" at a glance.
+        //
+        // Column widths are sized for realistic worst-case values:
+        //   d(m)  ±99.99   accel  ±19.99 g   |h|  0..99.99 g
+        //   gz    ±2000 dps  T  -40..125 °C  ok/miss up to 99999
+        if (MY_UWB_ROLE == UWB_ROLE_MAIN) {
+            static int peer_table_counter = 0;
 
-            peer_state_t snap[INITIATOR_PEER_COUNT];
-            peer_state_snapshot(snap);
-            int64_t now_us = esp_timer_get_time();
+            if (++peer_table_counter >= IMU_PRINT_HZ / 2) {  // ~2 Hz
+                peer_table_counter = 0;
 
-            if (++peer_grid_counter >= IMU_PRINT_HZ / 2) {  // ~2 Hz
-                peer_grid_counter = 0;
-                // Compact distance grid: one line, all 9 peers.
-                printf("# peers:");
-                for (size_t i = 0; i < INITIATOR_PEER_COUNT; i++) {
-                    char  suffix   = s_initiator_peer_list[i];
-                    int64_t age_ms = (now_us - snap[i].last_ok_us) / 1000;
-                    bool    fresh  = snap[i].result.valid && age_ms < PEER_STALE_MS;
-                    if (fresh) {
-                        printf("  W%c=%+5.2f", suffix, snap[i].result.distance_m);
-                    } else {
-                        printf("  W%c=  ---", suffix);
-                    }
-                }
-                printf("\n");
-            }
+                peer_state_t snap[UWB_MAX_PERIPHERALS];
+                peer_state_snapshot(snap);
+                int64_t now_us = esp_timer_get_time();
 
-            // Per-print rotation: show one peer's IMU detail. Skip stale
-            // slots silently and try the next one until we find one with
-            // fresh IMU or we've walked the whole list.
-            for (size_t tries = 0; tries < INITIATOR_PEER_COUNT; tries++) {
-                size_t i = peer_rotate_idx;
-                peer_rotate_idx = (peer_rotate_idx + 1) % INITIATOR_PEER_COUNT;
-                int64_t age_ms = (now_us - snap[i].last_ok_us) / 1000;
-                if (snap[i].result.peer_imu_valid &&
-                    snap[i].result.valid &&
-                    age_ms < PEER_STALE_MS) {
-                    const lsm6_sample_t &q = snap[i].result.peer_imu;
+                // Body-position labels, indexed by suffix - 'A'. Keep
+                // these short — they sit in a fixed-width column.
+                static const char *kPosLabel[UWB_MAX_PERIPHERALS] = {
+                    "Chest   ", "L Elbow ", "R Elbow ", "L Wrist ",
+                    "R Wrist ", "L Knee  ", "R Knee  ", "L Ankle ",
+                    "R Ankle ", "spare J ", "spare K ", "spare L ",
+                    "spare M ", "spare N ", "spare O ",
+                };
+
+                // Header. Reprint every cycle so the table is self-
+                // contained for log scraping. Column widths must match
+                // the format strings below or alignment breaks.
+                printf("# Node            d(m)     ax     ay     az    |h|       gz     T       ok   miss   age\n");
+
+                // Row 0: main itself. No distance to self. IMU comes from
+                // window_peak_sample (the most recent windowed reading
+                // already in hand). "ok/miss/age" not meaningful for the
+                // main's own UWB — leave blank.
+                {
+                    const lsm6_sample_t &q = window_peak_sample;
                     float h = sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g);
-                    printf("# W%c: d=%+.3fm  ax=%+.2f ay=%+.2f az=%+.2f  "
-                           "h|=%.2fg  gz=%+.1f dps  T=%.1f  "
-                           "ok=%lu miss=%lu age=%lldms\n",
-                           s_initiator_peer_list[i],
-                           snap[i].result.distance_m,
-                           q.ax_g, q.ay_g, q.az_g,
-                           h,
-                           q.gz_dps, q.temp_c,
-                           (unsigned long)snap[i].ok_count,
-                           (unsigned long)snap[i].miss_count,
-                           (long long)age_ms);
-                    break;
+                    printf("# Head  (main)    ---  %+6.2f %+6.2f %+6.2f  %5.2f  %+7.1f %5.1f      ---    ---   ---\n",
+                           q.ax_g, q.ay_g, q.az_g, h, q.gz_dps, q.temp_c);
+                }
+
+                // Rows 1..15: peripherals A..O.
+                for (size_t i = 0; i < UWB_MAX_PERIPHERALS; i++) {
+                    char    suffix = (char)('A' + i);
+                    int64_t age_ms = snap[i].last_ok_us == 0
+                                   ? -1
+                                   : (now_us - snap[i].last_ok_us) / 1000;
+                    bool fresh = snap[i].result.valid &&
+                                 age_ms >= 0 &&
+                                 age_ms < PEER_STALE_MS;
+
+                    // Row prefix is fixed-width so the table stays aligned.
+                    printf("# W%c (%s)", suffix, kPosLabel[i]);
+
+                    if (fresh) {
+                        const lsm6_sample_t &q = snap[i].result.peer_imu;
+                        bool imu_fresh = snap[i].result.peer_imu_valid;
+                        float h = imu_fresh
+                                ? sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g)
+                                : 0.0f;
+                        if (imu_fresh) {
+                            printf(" %+6.2f  %+6.2f %+6.2f %+6.2f  %5.2f  %+7.1f %5.1f",
+                                   snap[i].result.distance_m,
+                                   q.ax_g, q.ay_g, q.az_g, h,
+                                   q.gz_dps, q.temp_c);
+                        } else {
+                            // Distance valid, IMU not yet (peripheral
+                            // hadn't published a sample at the moment
+                            // the Final was assembled).
+                            printf(" %+6.2f     ---    ---    ---    ---      ---   ---",
+                                   snap[i].result.distance_m);
+                        }
+                    } else {
+                        // Nothing fresh: blank distance + IMU columns.
+                        // Counters and age still printed below to convey
+                        // link state independent of freshness.
+                        printf("    ---     ---    ---    ---    ---      ---   ---");
+                    }
+
+                    // Counters + age. age "---" if never seen.
+                    if (age_ms < 0) {
+                        printf("    %5lu  %5lu   ---\n",
+                               (unsigned long)snap[i].ok_count,
+                               (unsigned long)snap[i].miss_count);
+                    } else {
+                        printf("    %5lu  %5lu  %4lld\n",
+                               (unsigned long)snap[i].ok_count,
+                               (unsigned long)snap[i].miss_count,
+                               (long long)age_ms);
+                    }
                 }
             }
         }
@@ -370,48 +503,52 @@ static void imu_print_task(void *arg)
 static void uwb_task(void *arg)
 {
     ESP_LOGI(TAG, "UWB task started (role: %s)",
-             MY_UWB_ROLE == UWB_ROLE_INITIATOR ? "initiator" : "responder");
+             MY_UWB_ROLE == UWB_ROLE_MAIN ? "main" : "peripheral");
 
-    TickType_t next = xTaskGetTickCount();
-    size_t     peer_idx = 0;                       // Initiator round-robin index
-    int        responder_fails = 0;                // Consecutive misses on the responder
+    int peripheral_fails = 0;   // Consecutive misses on the peripheral
 
     while (true) {
-        uwb_range_result_t r;
-        char   peer_suffix;
-        size_t this_idx = 0;
+        if (MY_UWB_ROLE == UWB_ROLE_MAIN) {
+            // One call = one full TDMA round. Beacon TX, then sweep all
+            // 15 slots in order, collecting per-peripheral results.
+            // The round itself takes ~UWB_ROUND_PERIOD_MS, so no extra
+            // delay is needed — pacing is intrinsic.
+            uwb_range_result_t results[UWB_MAX_PERIPHERALS];
+            esp_err_t err = uwb_perform_round(results);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "uwb_perform_round failed (err=%d)", err);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
 
-        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
-            this_idx     = peer_idx;
-            peer_suffix  = s_initiator_peer_list[this_idx];
-            peer_idx     = (peer_idx + 1) % INITIATOR_PEER_COUNT;
-        } else {
-            peer_suffix  = 0;  // Ignored by responder cycle
-        }
-
-        esp_err_t err = uwb_perform_ranging(peer_suffix, &r);
-
-        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
-            if (err == ESP_OK && r.valid) {
-                peer_state_publish(this_idx, &r);
-            } else {
-                peer_state_record_miss(this_idx);
+            // Publish each slot's outcome to the per-peer state table.
+            for (size_t i = 0; i < UWB_MAX_PERIPHERALS; i++) {
+                bool success = results[i].valid;
+                diag_record(i, success);
+                if (success) {
+                    peer_state_publish(i, &results[i]);
+                } else {
+                    peer_state_record_miss(i);
+                }
             }
         } else {
-            // Responder side: same logic as before, single slot
+            // Peripheral: uwb_perform_round blocks on the beacon, then
+            // runs one slot exchange. Beacon RX is the pacing; no
+            // vTaskDelay needed. results[0] is the only meaningful slot.
+            uwb_range_result_t r;
+            esp_err_t err = uwb_perform_round(&r);
+
             if (err == ESP_OK && r.valid) {
-                self_range_publish(&r);
-                responder_fails = 0;
+                peripheral_fails = 0;
+                self_range_publish(&r);   // distance_m is 0; .valid = linked
             } else {
-                responder_fails++;
-                if (responder_fails == 5) {
+                peripheral_fails++;
+                if (peripheral_fails == 5) {
                     self_range_invalidate();
                     ESP_LOGW(TAG, "5 consecutive ranging failures, marking invalid");
                 }
             }
         }
-
-        vTaskDelayUntil(&next, pdMS_TO_TICKS(UWB_PERIOD_MS));
     }
 }
 
@@ -449,7 +586,7 @@ extern "C" void app_main(void)
     boot_reset_peripherals();
 
     // --- UWB ---
-    if (uwb_init(MY_UWB_ROLE, MY_RESPONDER_SUFFIX,
+    if (uwb_init(MY_UWB_ROLE, MY_PERIPHERAL_SUFFIX,
                  PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
         ESP_LOGE(TAG, "UWB init failed");
         return;

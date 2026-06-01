@@ -1,37 +1,53 @@
-/* uwb_ranging.c — Double-Sided Two-Way Ranging (DS-TWR)
+/* uwb_ranging.c — TDMA DS-TWR with beacon synchronisation
  *
- * Frame sequence:
+ * One ROUND, viewed on the air:
  *
- *   Initiator                            Responder
- *      |                                     |
- *      |--- Poll -------------------------->|   reads poll_rx_ts
- *      |<-- Response -----------------------|   (poll_rx_ts, resp_tx_ts)
- *      |   reads resp_rx_ts                  |   scheduled via delayed TX
- *      |--- Final ------------------------->|   reads final_rx_ts
- *      |   includes [poll_tx, resp_rx,       |   computes DS-TWR ToF
- *      |             final_tx]               |
- *      |<-- Report -------------------------|   (distance_mm)
- *      |   stores distance                   |
+ *   t=0          Beacon  (main broadcast, addressed to FFFF)
+ *   t=1×slot     ──────────── slot 1 (peripheral 'A') ─────────────
+ *                Poll  : peripheral → main
+ *                Resp  : main       → peripheral   (delayed 6 ms after Poll RX)
+ *                Final : peripheral → main         (delayed 6 ms after Resp RX,
+ *                                                   carries 3 timestamps + IMU)
+ *                Main computes distance for peripheral 'A'
+ *   t=2×slot     ──────────── slot 2 (peripheral 'B') ─────────────
+ *                ... same pattern ...
+ *   ...
+ *   t=15×slot    ──────────── slot 15 (peripheral 'O') ────────────
+ *   t=round_end  guard band
+ *   t=round      Next beacon
  *
- * Why DS-TWR over SS-TWR:
- *   - SS-TWR computes ToF = (Ra - Db) / 2 where Ra uses initiator clock
- *     and Db uses responder clock. Clock drift between the two adds a
- *     systematic error proportional to the reply delay (~18 mm/ms at
- *     20 ppm clock skew). With our 3 ms reply delays, that's tens of cm.
+ * Why beacon synchronisation:
+ *   Two ESP32 host clocks running open-loop at "30 Hz" diverge at ~50 ppm
+ *   = 6 ms after 2 minutes — exactly the size of the reply-delay budget,
+ *   which is why the old code worked for ~2 minutes and then collapsed.
+ *   The fix: the peripheral schedules its Poll using dwt_setdelayedtrxtime
+ *   referenced to the DW3000's hardware RX timestamp of the beacon. That's
+ *   the same 499.2 MHz clock DS-TWR uses, and it's freshly captured every
+ *   round. Host-clock drift can be arbitrary; the slot still lands.
  *
- *   - DS-TWR uses (Ra*Rb - Da*Db) / (Ra+Rb+Da+Db). Drift terms cancel
- *     to first order, leaving residual error in the cm range or better.
+ * Why no collisions:
+ *   Each peripheral has a unique slot index (= suffix 'A'..'O' = 1..15).
+ *   Its Poll is scheduled exactly at slot_index × UWB_SLOT_WIDTH_MS after
+ *   the beacon. Slots don't overlap by construction. If a peripheral
+ *   misses its beacon, it stays quiet for the round (no late Poll firing
+ *   into a neighbor's slot) and re-syncs on the next beacon.
  *
- * Formula derivation (Qorvo "asymmetric DS-TWR"):
- *   Ra = resp_rx_ts - poll_tx_ts         (initiator round-trip 1)
- *   Rb = final_rx_ts - resp_tx_ts        (responder round-trip)
- *   Da = final_tx_ts - resp_rx_ts        (initiator reply delay)
- *   Db = resp_tx_ts - poll_rx_ts         (responder reply delay)
- *   ToF = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
+ * Why this fixes thermal drift too:
+ *   The recovery ladder (uwb_handle_cycle_result) is now actually wired
+ *   in at the per-slot level, AND there's a proactive recal every
+ *   RECAL_INTERVAL_US regardless of miss count. The DW3000's PLL retunes
+ *   periodically without waiting for a miss streak.
  *
- *   Distance = ToF * speed_of_light * tick_period.
+ * Compared to the previous (non-TDMA) 3-message version:
+ *   - New beacon frame (function code FN_BEACON, header-only payload).
+ *   - Peripheral cycle now BLOCKS on beacon RX before doing anything.
+ *   - Peripheral schedules Poll as a delayed TX from beacon RX timestamp,
+ *     instead of an immediate TX from "whenever the host gets around to it".
+ *   - Main API is now uwb_perform_round (sweeps all slots) instead of
+ *     uwb_perform_ranging (one peer at a time).
+ *   - Frame-level DS-TWR math inside one slot is unchanged.
  *
- * Two scheduled-TX gotchas (both apply on both ends):
+ * Two scheduled-TX gotchas (unchanged from earlier — repeated for reference):
  *   - dwt_setdelayedtrxtime takes timestamp >> 8 (top 32 bits of a
  *     40-bit value).
  *   - The hardware ALSO zeros bit 0 of that value (= bit 8 of timestamp).
@@ -50,6 +66,7 @@
 #include "freertos/task.h"
 #include "esp_rom_sys.h"
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "uwb";
 
@@ -57,41 +74,78 @@ static const char *TAG = "uwb";
 /* Tunables                                                              */
 /* --------------------------------------------------------------------- */
 
-/* Antenna delay (in DW3000 ticks ~15.65 ps each). 16385 is Qorvo's stock
- * default for channel 5 — uncalibrated. Run a known-distance calibration
- * once DS-TWR is stable. Off-by-1 here = off by ~0.5 cm in distance. */
 #define TX_ANT_DLY 16385
 #define RX_ANT_DLY 16385
 
-/* UWB µs (uus) = 65536 DTU = ~1.0256 µs wall-clock.
- *
- * NOTE: the suffix matters! Without it, expressions like
- *   POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME
- * where the delay is >= 32768 overflow signed int (32-bit) and produce
- * undefined behavior — typically wrapping to a negative number which,
- * when added to poll_rx_ts as uint64, makes the scheduled time go
- * backwards. Use the UL suffix to force unsigned-long evaluation. */
+/* UWB µs (uus) = 65536 DTU = ~1.0256 µs wall-clock. UL suffix prevents
+ * signed-int overflow in delay × UUS_TO_DWT_TIME expressions. */
 #define UUS_TO_DWT_TIME 65536UL
 
-/* Initiator: Response RX window after Poll TX. */
+/* Peripheral: Response RX window after Poll TX. */
 #define POLL_TX_TO_RESP_RX_DLY_UUS  4000
 #define RESP_RX_TIMEOUT_UUS         8000
 
-/* Responder: scheduled Response TX delay after Poll RX. ~500 us of host
- * overhead measured + 1 ms detection jitter + margin = 6 ms. */
+/* Main: scheduled Response TX delay after Poll RX. */
 #define POLL_RX_TO_RESP_TX_DLY_UUS  6000
 
-/* Initiator: scheduled Final TX delay after Response RX. */
+/* Peripheral: scheduled Final TX delay after Response RX. */
 #define RESP_RX_TO_FINAL_TX_DLY_UUS 6000
 
-/* Responder: Final RX window after Response TX. Open immediately, keep
- * open for ~12 ms to absorb initiator-side scheduling jitter. */
+/* Main: Final RX window after Response TX. */
 #define RESP_TX_TO_FINAL_RX_DLY_UUS  0
 #define FINAL_RX_TIMEOUT_UUS         12000
 
-/* Initiator: Report RX window after Final TX. */
-#define FINAL_TX_TO_REPORT_RX_DLY_UUS 0
-#define REPORT_RX_TIMEOUT_UUS         8000
+/* Main per-slot Poll-listen window. CRITICAL: this must equal
+ * UWB_SLOT_WIDTH_MS (the slot duration the peripheral uses to schedule
+ * its Poll). If shorter, the main's listen for slot i closes before the
+ * peripheral actually transmits its Poll, and exchanges miss even with a
+ * perfect link.
+ *
+ * The peripheral schedules its Poll at (slot - 1) × UWB_SLOT_WIDTH_MS +
+ * PERIPHERAL_POLL_LEAD_US after beacon RX (see PERIPHERAL_POLL_LEAD_US
+ * below). The main starts listening for slot 1 immediately after the
+ * beacon TX completes, so its slot N listen window covers roughly
+ * (N-1) × SLOT_WIDTH_MS to N × SLOT_WIDTH_MS after beacon. As long as
+ * the window widths match, the windows align.
+ *
+ * Original bug: I used 10 ms here while the peripheral schedules at 15
+ * ms intervals, so by the time peripheral 'A' fired its Poll the main
+ * had already moved on to listening for 'B'. */
+#define POLL_RX_TIMEOUT_PER_SLOT_UUS  (UWB_SLOT_WIDTH_MS * 1000)
+/* Software ceiling: hw timeout + margin for slow status polling. */
+#define POLL_RX_SW_TIMEOUT_US         (UWB_SLOT_WIDTH_MS * 1000 + 3000)
+
+/* Peripheral Poll TX is scheduled at (slot - 1) × UWB_SLOT_WIDTH_MS +
+ * PERIPHERAL_POLL_LEAD_US after beacon RX. The lead pushes the Poll a
+ * little past the slot boundary so it lands comfortably inside the
+ * main's listen window (which is starting at the slot boundary).
+ *
+ * Sizing the lead: between beacon RX and dwt_starttx(DELAYED) on the
+ * peripheral, the host must run ~5-6 SPI transactions (read frame, read
+ * timestamp, write TX data, write fctrl, set RX-after-TX, set delayed
+ * time, starttx). On ESP32-C6 over the QM33 SDK, this is empirically
+ * 3-5 ms. The lead MUST exceed that, or dwt_starttx returns DWT_ERROR
+ * ("late") and the slot is wasted.
+ *
+ * Previous bug: 2 ms lead was below host-latency floor and the Poll was
+ * cancelled every single time. Visible as "Poll TX late/cancelled" with
+ * the peripheral reaching 100% beacon RX but 0% Poll TX.
+ *
+ * 5 ms is conservative — eats only 5/15 ms of the slot budget, leaving
+ * 10 ms for the Response listen + Final TX (plenty, since both use
+ * delayed TX timed off DW3000 clocks, not host clocks). Bump higher if
+ * you still see "Poll TX late" in production, or lower if you've
+ * profiled the host path. */
+#define PERIPHERAL_POLL_LEAD_US       5000
+
+/* Peripheral beacon-listen window. The peripheral should be sitting in
+ * receive when the beacon arrives; on cold start or after a miss, it
+ * waits up to two full rounds before giving up. */
+#define BEACON_RX_TIMEOUT_US  (2 * UWB_ROUND_PERIOD_MS * 1000)
+
+/* Proactive recal cadence (microseconds). Independent of miss count; this
+ * absorbs thermal drift before it causes misses. */
+#define RECAL_INTERVAL_US     (30 * 1000 * 1000)   /* 30 seconds          */
 
 /* Speed of light in air ≈ 299,702,547 m/s. */
 #define SPEED_OF_LIGHT_M_PER_S      299702547.0
@@ -105,56 +159,47 @@ float g_uwb_distance_offset_m = 0.0f;
 /* Frame layout                                                          */
 /* --------------------------------------------------------------------- */
 
-/* IEEE 802.15.4 short-address header (10 bytes):
- *   [0..1] frame control (0x88 0x41)
- *   [2]    sequence number
- *   [3..4] PAN ID (0xDECA)
- *   [5..6] dest short address
- *   [7..8] src  short address
- *   [9]    function code
- * Then function-specific payload, then 2-byte FCS appended by hardware. */
-
 #define FRAME_FC_0      0x41
 #define FRAME_FC_1      0x88
 #define PAN_ID_LO       0xCA
 #define PAN_ID_HI       0xDE
 
-#define ADDR_INIT_LO    'V'
-#define ADDR_INIT_HI    'E'
+#define ADDR_MAIN_LO    'V'
+#define ADDR_MAIN_HI    'E'
 
-/* All responders share the prefix 'W'; the suffix ('A'..'I') is set at
- * uwb_init time via responder_addr_suffix. The initiator picks a specific
- * responder per cycle via the peer_addr_suffix argument to
- * uwb_perform_ranging. */
-#define ADDR_RESP_PREFIX 'W'
-#define DEFAULT_RESP_SUFFIX 'A'
+#define ADDR_PERIPH_PREFIX 'W'
+#define DEFAULT_PERIPH_SUFFIX 'A'
 
+/* Broadcast short-address used for the beacon dst field. */
+#define ADDR_BCAST_LO   0xFF
+#define ADDR_BCAST_HI   0xFF
+
+#define FN_BEACON       0x40
 #define FN_POLL         0x21
 #define FN_RESPONSE     0x10
 #define FN_FINAL        0x29
-#define FN_REPORT       0x2A
 
 #define FCS_LEN         2
 
+/* Beacon: header only (10 bytes). The round counter is embedded for
+ * debug/jitter analysis but isn't required by the protocol. */
+#define BEACON_FRAME_LEN 14
+#define BEACON_ROUND_IDX 10   /* uint32 round counter, little-endian */
+
 #define POLL_FRAME_LEN  10
-/* Response: header + poll_rx_ts(5) + resp_tx_ts(5) */
+
+/* Response: header + poll_rx_ts(5) + resp_tx_ts(5). */
 #define RESP_FRAME_LEN  20
 #define RESP_POLL_RX_TS_IDX 10
 #define RESP_RESP_TX_TS_IDX 15
-/* Final: header + poll_tx_ts(5) + resp_rx_ts(5) + final_tx_ts(5) */
-#define FINAL_FRAME_LEN 25
+
+/* Final: header + poll_tx_ts(5) + resp_rx_ts(5) + final_tx_ts(5)
+ *                + imu_sample (sizeof(lsm6_sample_t)). */
 #define FINAL_POLL_TX_TS_IDX  10
 #define FINAL_RESP_RX_TS_IDX  15
 #define FINAL_FINAL_TX_TS_IDX 20
-/* Report: header + distance_mm(4) + imu_sample (sizeof(lsm6_sample_t)).
- *
- * Floats serialize via memcpy — both boards are little-endian RISC-V
- * with the same IEEE-754 representation, so byte-equality round-trips.
- * If you ever support a mixed-architecture peer, switch to explicit
- * float-to-int16 packing or a wire-level fixed-point encoding. */
-#define REPORT_FRAME_LEN   (14 + (int)sizeof(lsm6_sample_t))
-#define REPORT_DIST_IDX    10
-#define REPORT_IMU_IDX     14
+#define FINAL_IMU_IDX         25
+#define FINAL_FRAME_LEN   (25 + (int)sizeof(lsm6_sample_t))
 
 /* --------------------------------------------------------------------- */
 /* State                                                                  */
@@ -167,18 +212,74 @@ static uint8_t    s_my_addr_hi;
 static uint8_t    s_peer_addr_lo;
 static uint8_t    s_peer_addr_hi;
 
+/* Peripheral-side: this device's slot index (1..UWB_MAX_PERIPHERALS),
+ * derived from its address suffix at init time. */
+static uint8_t    s_my_slot_index = 0;
+
+/* Main-side: round counter, advanced once per beacon. */
+static uint32_t   s_round_counter = 0;
+
+/* Last proactive recal time (host us). Used by both roles. */
+static int64_t    s_last_recal_us = 0;
+
 /* Local IMU snapshot, published by uwb_publish_local_imu and read by the
- * responder when assembling the Report frame. Protected by spinlock so
- * the imu timer callback (publisher) and uwb task (consumer) can run on
- * different cores without tearing. */
+ * peripheral when assembling the Final frame. */
 static portMUX_TYPE  s_imu_lock = portMUX_INITIALIZER_UNLOCKED;
 static lsm6_sample_t s_local_imu;
 static bool          s_local_imu_valid = false;
 
-/* Report frame size is 14 + sizeof(lsm6_sample_t) = 54. Plus FCS = 56.
- * Bump RX buffer to comfortably hold it. */
-#define RX_BUF_LEN 64
+#define RX_BUF_LEN 96
 static uint8_t rx_buf[RX_BUF_LEN];
+
+/* Consecutive-miss counter drives reactive recovery. */
+static int s_consec_miss = 0;
+#define RECOVER_RECONFIG_AFTER  8
+#define RECOVER_HARD_AFTER      40
+
+/* Link-up state. Peripheral only.
+ *
+ *   s_ever_linked = false  until the very first beacon RX
+ *   s_ever_linked = true   after at least one beacon has been received
+ *
+ * Before the first beacon, "missing the beacon" is the normal state and
+ * we DON'T recalibrate — the main is probably just not powered yet, and
+ * recalibrating an idle radio doesn't make it more likely to hear a
+ * not-yet-transmitting peer. We just keep waiting.
+ *
+ * After s_ever_linked is set, beacon misses ARE evidence of a problem
+ * (drift, thermal, interference) and the normal recal ladder applies.
+ *
+ * On the main this stays false; the main is never "waiting for a peer"
+ * in the same blocking sense — it just transmits and listens. */
+static bool s_ever_linked = false;
+
+/* Diagnostic: count any RX event the chip reports (good frame, bad CRC,
+ * frame error, preamble timeout, frame timeout). If this stays at 0 over
+ * a long window the radio isn't seeing energy at all — strong hint of
+ * antenna / RF / channel-mismatch issue rather than a protocol bug. */
+static uint32_t s_rx_event_count    = 0;
+static uint32_t s_rx_good_count     = 0;
+static int64_t  s_last_diag_log_us  = 0;
+#define RX_DIAG_INTERVAL_US (5 * 1000 * 1000)   /* every 5 s */
+
+/* Why the last cycle failed (peripheral side). Recovery treats different
+ * miss reasons differently — a "Poll late" miss means host scheduling is
+ * tight, not that the radio is broken, so recalibration would only make
+ * things worse (recal pauses the radio for ms, making the next Poll even
+ * later). The next call to uwb_handle_cycle_result reads this and skips
+ * recovery if the miss was timing-related. */
+typedef enum {
+    UWB_MISS_NONE = 0,
+    UWB_MISS_NO_BEACON,        /* RX path issue / link down */
+    UWB_MISS_POLL_LATE,        /* host scheduling — DON'T recal */
+    UWB_MISS_RESP_RX,          /* main didn't reply / corrupted */
+    UWB_MISS_FINAL_TX,         /* our own TX failed */
+    UWB_MISS_OTHER,
+} uwb_miss_reason_t;
+static uwb_miss_reason_t s_last_miss_reason = UWB_MISS_NONE;
+
+#define UWB_TX_ANT_DLY TX_ANT_DLY
+#define UWB_RX_ANT_DLY RX_ANT_DLY
 
 /* --------------------------------------------------------------------- */
 /* Config                                                                 */
@@ -213,6 +314,14 @@ static const dwt_txconfig_t s_txconfig = {
 #endif
 #define SYS_STATUS_RX_ANY (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)
 
+/* PLL-lock bit: CPLOCK is bit 1 of SYS_STATUS_LO. The SDK normally
+ * exposes it as SYS_STATUS_CPLOCK_BIT_MASK; fall back to the raw bit if
+ * not. The diagnostic prints whether the PLL is locked at the moment we
+ * sample status — useful when "nothing works" might be a stuck PLL. */
+#ifndef SYS_STATUS_CPLOCK_BIT_MASK
+#define SYS_STATUS_CPLOCK_BIT_MASK (1u << 1)
+#endif
+
 /* --------------------------------------------------------------------- */
 /* Frame helpers                                                          */
 /* --------------------------------------------------------------------- */
@@ -233,6 +342,7 @@ static void fill_header(uint8_t *frame, uint8_t fn,
     frame[9] = fn;
 }
 
+/* Non-broadcast header check (Poll/Response/Final): dest must be us. */
 static bool header_ok(const uint8_t *f, uint8_t expected_fn)
 {
     return f[0] == FRAME_FC_0 &&
@@ -244,6 +354,22 @@ static bool header_ok(const uint8_t *f, uint8_t expected_fn)
            f[7] == s_peer_addr_lo &&
            f[8] == s_peer_addr_hi &&
            f[9] == expected_fn;
+}
+
+/* Beacon header check: dst is broadcast, src is main, fn = BEACON. The
+ * peripheral does NOT check s_peer_addr (it accepts beacons from any
+ * 'VE' regardless of its own per-slot peer state). */
+static bool beacon_header_ok(const uint8_t *f)
+{
+    return f[0] == FRAME_FC_0 &&
+           f[1] == FRAME_FC_1 &&
+           f[3] == PAN_ID_LO  &&
+           f[4] == PAN_ID_HI  &&
+           f[5] == ADDR_BCAST_LO &&
+           f[6] == ADDR_BCAST_HI &&
+           f[7] == ADDR_MAIN_LO  &&
+           f[8] == ADDR_MAIN_HI  &&
+           f[9] == FN_BEACON;
 }
 
 static void ts_to_frame(uint8_t *p, uint64_t ts)
@@ -299,9 +425,6 @@ static bool wait_txfrs(int timeout_us)
     return false;
 }
 
-/* Wait for RX completion / error / timeout. Polls every 50 µs; every
- * 1 ms without an event, yields via vTaskDelay(1) so IDLE can run and
- * feed the WDT. Assumes CONFIG_FREERTOS_HZ=1000 so vTaskDelay(1) = 1 ms. */
 static uint32_t wait_rx_event(int timeout_us)
 {
     int waited = 0;
@@ -326,12 +449,9 @@ static uint32_t wait_rx_event(int timeout_us)
 }
 
 /* --------------------------------------------------------------------- */
-/* DS-TWR distance computation (used on the responder)                   */
+/* DS-TWR distance computation (used on the main node)                   */
 /* --------------------------------------------------------------------- */
 
-/* Compute distance from the four DS-TWR durations.
- * All inputs are 64-bit, but the *differences* fit in 32 bits and that's
- * how Qorvo's reference computes them. Returns distance in meters. */
 static double dstwr_distance_m(uint64_t poll_tx_ts, uint64_t resp_rx_ts,
                                uint64_t final_tx_ts,
                                uint64_t poll_rx_ts, uint64_t resp_tx_ts,
@@ -342,11 +462,9 @@ static double dstwr_distance_m(uint64_t poll_tx_ts, uint64_t resp_rx_ts,
     int64_t Da = (int64_t)((uint32_t)(final_tx_ts - resp_rx_ts));
     int64_t Db = (int64_t)((uint32_t)(resp_tx_ts  - poll_rx_ts));
 
-    /* Numerator and denominator can be quite large; use int64 (safe up to
-     * ~9.2e18) before converting to double. */
     int64_t num = Ra * Rb - Da * Db;
     int64_t den = Ra + Rb + Da + Db;
-    if (den == 0) return -1.0;  /* shouldn't happen, defensive */
+    if (den == 0) return -1.0;
 
     double tof_ticks = (double)num / (double)den;
     double tof_s     = tof_ticks * DWT_TIME_UNITS;
@@ -354,89 +472,575 @@ static double dstwr_distance_m(uint64_t poll_tx_ts, uint64_t resp_rx_ts,
 }
 
 /* --------------------------------------------------------------------- */
-/* Initiator                                                              */
+/* Recovery                                                              */
 /* --------------------------------------------------------------------- */
 
-static esp_err_t initiator_cycle(uwb_range_result_t *result)
+static void uwb_handle_cycle_result(bool cycle_ok)
 {
-    dwt_forcetrxoff();
-    /* Clear ALL TX and RX status bits — leftover from previous cycle
-     * (especially after a failed delayed-TX) can break the next cycle. */
+    if (cycle_ok) {
+        s_consec_miss = 0;
+        return;
+    }
+
+    s_consec_miss++;
+
+    /* Peripheral-only: if we've never received a beacon, this is the
+     * "main not yet powered / out of range" state. Recalibrating doesn't
+     * help — the radio is fine, there's just no signal to hear yet. */
+    if (s_role == UWB_ROLE_PERIPHERAL && !s_ever_linked) {
+        if (s_consec_miss == 1 || s_consec_miss % 50 == 0) {
+            ESP_LOGW(TAG, "Waiting for first beacon (%d attempts so far) — "
+                          "is the main powered and on the same channel?",
+                     s_consec_miss);
+        }
+        return;
+    }
+
+    /* Peripheral-only: Poll-late misses are a host-timing problem, not a
+     * radio problem. Recalibrating would pause the radio for several ms,
+     * making the next Poll EVEN MORE likely to be late — a death spiral.
+     * Just count the miss and skip the recal ladder. The user-visible
+     * "Poll TX late" log already includes the action to take (bump
+     * PERIPHERAL_POLL_LEAD_US). */
+    if (s_role == UWB_ROLE_PERIPHERAL && s_last_miss_reason == UWB_MISS_POLL_LATE) {
+        return;
+    }
+
+    if (s_consec_miss >= RECOVER_HARD_AFTER) {
+        ESP_LOGE(TAG, "%d consec misses -> hard recover", s_consec_miss);
+        if (dwm3000_hard_recover() == ESP_OK) {
+            dwm3000_reconfigure_recover(&s_uwb_config, &s_txconfig,
+                                        UWB_TX_ANT_DLY, UWB_RX_ANT_DLY);
+        }
+        s_consec_miss = 0;
+        s_last_recal_us = esp_timer_get_time();
+        return;
+    }
+
+    if (s_consec_miss % RECOVER_RECONFIG_AFTER == 0) {
+        ESP_LOGW(TAG, "%d consec misses -> reconfigure+recal (DW T=%.1f C)",
+                 s_consec_miss, dwm3000_read_temp_c());
+        dwm3000_reconfigure_recover(&s_uwb_config, &s_txconfig,
+                                    UWB_TX_ANT_DLY, UWB_RX_ANT_DLY);
+        s_last_recal_us = esp_timer_get_time();
+    }
+}
+
+/* Proactive recal — run between rounds (main) or between cycles
+ * (peripheral) regardless of miss count. Absorbs thermal drift before it
+ * accumulates into misses. */
+static void uwb_proactive_recal_if_due(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_last_recal_us == 0) {
+        s_last_recal_us = now;   /* arm on first call so we don't recal at t=0 */
+        return;
+    }
+    if (now - s_last_recal_us >= RECAL_INTERVAL_US) {
+        ESP_LOGI(TAG, "Proactive recal (DW T=%.1f C, %lld s since last)",
+                 dwm3000_read_temp_c(),
+                 (long long)((now - s_last_recal_us) / 1000000));
+        dwm3000_reconfigure_recover(&s_uwb_config, &s_txconfig,
+                                    UWB_TX_ANT_DLY, UWB_RX_ANT_DLY);
+        s_last_recal_us = now;
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Per-slot exchange — runs once per slot on MAIN                        */
+/* --------------------------------------------------------------------- */
+
+/* Listens for Poll from the peripheral whose address is currently in
+ * (s_peer_addr_lo, s_peer_addr_hi); does Response + Final RX; computes
+ * distance into *out. Returns true on a fully successful exchange.
+ *
+ * Called only by main_round_tdma. */
+static bool main_handle_one_slot(uwb_range_result_t *out)
+{
     dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
                        | SYS_STATUS_TXFRB_BIT_MASK
                        | SYS_STATUS_TXPRS_BIT_MASK
                        | SYS_STATUS_TXPHS_BIT_MASK
                        | SYS_STATUS_RX_ANY);
 
-    /* === 1. Send Poll, expect Response. === */
-    uint8_t poll[POLL_FRAME_LEN];
-    fill_header(poll, FN_POLL,
-                s_peer_addr_lo, s_peer_addr_hi,
-                s_my_addr_lo, s_my_addr_hi);
-
-    dwt_writetxdata(POLL_FRAME_LEN, poll, 0);
-    dwt_writetxfctrl(POLL_FRAME_LEN + FCS_LEN, 0, 1);
-
-    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
-        ESP_LOGE(TAG, "Poll TX start failed");
-        return ESP_FAIL;
+    /* === 1. Listen for Poll within this slot. === */
+    dwt_setrxaftertxdelay(0);
+    dwt_setrxtimeout(POLL_RX_TIMEOUT_PER_SLOT_UUS);
+    if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
+        ESP_LOGE(TAG, "slot rxenable failed");
+        return false;
     }
 
-    /* === 2. Wait for Response RX. ===
-     * Software timeout exceeds hw RESP_RX_TIMEOUT_UUS + POLL_TX_TO_RESP_RX_DLY_UUS
-     * plus margin. */
-    uint32_t status = wait_rx_event(15000);
+    uint32_t status = wait_rx_event(POLL_RX_SW_TIMEOUT_US);
     if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
         if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
-        static int miss_log = 0;
-        if (miss_log < 5 || miss_log % 50 == 0) {
-            ESP_LOGW(TAG, "Resp RX miss #%d (status=0x%08lX)", miss_log, (unsigned long)status);
+        dwt_forcetrxoff();
+        return false;
+    }
+    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
+
+    /* === 2. Validate Poll: must be addressed to us AND from the
+     * peripheral assigned to this slot. A wrong-suffix Poll means a
+     * peripheral fired in the wrong slot — drop and let the slot expire. */
+    uint8_t  ranging_bit = 0;
+    uint16_t flen = dwt_getframelength(&ranging_bit);
+    if (flen != POLL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
+        dwt_forcetrxoff();
+        return false;
+    }
+    dwt_readrxdata(rx_buf, POLL_FRAME_LEN, 0);
+    if (!header_ok(rx_buf, FN_POLL)) {
+        dwt_forcetrxoff();
+        return false;
+    }
+    uint8_t peer_seq = rx_buf[2];
+
+    /* === 3. Schedule Response, prepare for Final RX. === */
+    dwt_setrxaftertxdelay(RESP_TX_TO_FINAL_RX_DLY_UUS);
+    dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+
+    uint64_t poll_rx_ts = get_rx_timestamp_u64();
+    uint32_t resp_tx_time = (uint32_t)((poll_rx_ts +
+                                        (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME))
+                                       >> 8);
+    uint64_t resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+    uint8_t resp[RESP_FRAME_LEN];
+    s_seq = peer_seq;
+    fill_header(resp, FN_RESPONSE,
+                s_peer_addr_lo, s_peer_addr_hi,
+                s_my_addr_lo, s_my_addr_hi);
+    ts_to_frame(&resp[RESP_POLL_RX_TS_IDX], poll_rx_ts);
+    ts_to_frame(&resp[RESP_RESP_TX_TS_IDX], resp_tx_ts);
+
+    dwt_writetxdata(RESP_FRAME_LEN, resp, 0);
+    dwt_writetxfctrl(RESP_FRAME_LEN + FCS_LEN, 0, 1);
+    dwt_setdelayedtrxtime(resp_tx_time);
+
+    /* DW3000 errata workaround: stale RX timeout/error status bits cause
+     * dwt_starttx(DELAYED) to spuriously return DWT_ERROR even when the
+     * scheduled time is far in the future. Clear them right before the
+     * call. See Qorvo forum 21963 (Pirmin's finding, Mar 2025). */
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+
+    int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+    if (txret != DWT_SUCCESS) {
+        dwt_forcetrxoff();
+        return false;
+    }
+
+    /* === 4. Wait for Final RX. === */
+    status = wait_rx_event(20000);
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
-        miss_log++;
+        dwt_forcetrxoff();
+        return false;
+    }
+    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
+
+    /* === 5. Validate Final and extract timestamps + IMU. === */
+    flen = dwt_getframelength(&ranging_bit);
+    if (flen != FINAL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
+        dwt_forcetrxoff();
+        return false;
+    }
+    dwt_readrxdata(rx_buf, FINAL_FRAME_LEN, 0);
+    if (!header_ok(rx_buf, FN_FINAL)) {
+        dwt_forcetrxoff();
+        return false;
+    }
+
+    uint64_t poll_tx_ts  = ts_from_frame(&rx_buf[FINAL_POLL_TX_TS_IDX]);
+    uint64_t resp_rx_ts  = ts_from_frame(&rx_buf[FINAL_RESP_RX_TS_IDX]);
+    uint64_t final_tx_ts = ts_from_frame(&rx_buf[FINAL_FINAL_TX_TS_IDX]);
+    uint64_t final_rx_ts = get_rx_timestamp_u64();
+
+    /* === 6. Compute distance. === */
+    double distance_m = dstwr_distance_m(poll_tx_ts, resp_rx_ts, final_tx_ts,
+                                         poll_rx_ts, resp_tx_ts, final_rx_ts);
+
+    if (distance_m < -1.0 || distance_m > 500.0) {
+        dwt_forcetrxoff();
+        return false;
+    }
+
+    double distance_m_calibrated = distance_m - g_uwb_distance_offset_m;
+    if (out) {
+        out->distance_m   = (float)distance_m_calibrated;
+        out->timestamp_us = esp_timer_get_time();
+        out->valid        = true;
+
+        /* Peripheral's IMU. All-0xFF = "no sample yet" sentinel. */
+        bool all_ff = true;
+        for (size_t i = 0; i < sizeof(lsm6_sample_t); i++) {
+            if (rx_buf[FINAL_IMU_IDX + i] != 0xFF) { all_ff = false; break; }
+        }
+        if (!all_ff) {
+            memcpy(&out->peer_imu, &rx_buf[FINAL_IMU_IDX],
+                   sizeof(out->peer_imu));
+            out->peer_imu_valid = true;
+        } else {
+            out->peer_imu_valid = false;
+        }
+    }
+
+    dwt_forcetrxoff();
+    return true;
+}
+
+/* --------------------------------------------------------------------- */
+/* MAIN: one full TDMA round                                             */
+/* --------------------------------------------------------------------- */
+
+static esp_err_t main_round_tdma(uwb_range_result_t *results)
+{
+    /* Pre-init all result slots to invalid. */
+    for (int i = 0; i < UWB_MAX_PERIPHERALS; i++) {
+        results[i].valid          = false;
+        results[i].distance_m     = 0.0f;
+        results[i].timestamp_us   = 0;
+        results[i].peer_imu_valid = false;
+    }
+
+    /* Proactive recal between rounds (cheap, happens once per ~RECAL_INTERVAL). */
+    uwb_proactive_recal_if_due();
+
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
+                       | SYS_STATUS_TXFRB_BIT_MASK
+                       | SYS_STATUS_TXPRS_BIT_MASK
+                       | SYS_STATUS_TXPHS_BIT_MASK
+                       | SYS_STATUS_RX_ANY);
+
+    /* === Slot 0: broadcast beacon. ===
+     * The beacon's TX timestamp anchors every peripheral's slot timing
+     * for this round. Send it as IMMEDIATE — peripherals are already
+     * sitting in RX waiting for it. */
+    uint8_t beacon[BEACON_FRAME_LEN];
+    s_seq++;
+    fill_header(beacon, FN_BEACON,
+                ADDR_BCAST_LO, ADDR_BCAST_HI,
+                s_my_addr_lo, s_my_addr_hi);
+    beacon[BEACON_ROUND_IDX + 0] = (uint8_t)(s_round_counter);
+    beacon[BEACON_ROUND_IDX + 1] = (uint8_t)(s_round_counter >> 8);
+    beacon[BEACON_ROUND_IDX + 2] = (uint8_t)(s_round_counter >> 16);
+    beacon[BEACON_ROUND_IDX + 3] = (uint8_t)(s_round_counter >> 24);
+
+    dwt_writetxdata(BEACON_FRAME_LEN, beacon, 0);
+    dwt_writetxfctrl(BEACON_FRAME_LEN + FCS_LEN, 0, 1);
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        ESP_LOGE(TAG, "Beacon TX start failed");
+        return ESP_FAIL;
+    }
+    bool txfrs_ok = wait_txfrs(5000);
+    if (!txfrs_ok) {
+        ESP_LOGW(TAG, "Beacon TXFRS timeout (round %lu)",
+                 (unsigned long)s_round_counter);
+        /* Don't bail — peripherals may have caught the preamble anyway. */
+    }
+
+    /* Periodic beacon-TX diagnostic. Confirms beacons are actually going
+     * out (TXFRS asserted). If you see "TXFRS=NO" repeatedly here while
+     * the peripheral sees no RX events, the main's TX path is the problem.
+     *
+     * NOTE on PLL: CPLOCK is an *edge* status bit (set when the PLL locks
+     * coming out of reset/recal), not held while locked. Reading it later
+     * always shows "UNLOCKED" even on a healthy radio — so it's NOT a
+     * useful runtime PLL-health indicator. The real signal is whether
+     * TXFRS keeps asserting; if TX completes, the PLL is fine. */
+    {
+        static int64_t s_last_main_diag_us = 0;
+        static int     s_diag_txfrs_ok_total = 0;
+        static int     s_diag_txfrs_fail_total = 0;
+        if (txfrs_ok) s_diag_txfrs_ok_total++;
+        else          s_diag_txfrs_fail_total++;
+
+        int64_t now_us = esp_timer_get_time();
+        if (s_last_main_diag_us == 0) s_last_main_diag_us = now_us;
+        if (now_us - s_last_main_diag_us >= RX_DIAG_INTERVAL_US) {
+            ESP_LOGI(TAG, "TX diag: round=%lu  beacons OK=%d/FAIL=%d  T=%.1f C",
+                     (unsigned long)s_round_counter,
+                     s_diag_txfrs_ok_total,
+                     s_diag_txfrs_fail_total,
+                     dwm3000_read_temp_c());
+            s_last_main_diag_us = now_us;
+            s_diag_txfrs_ok_total = 0;
+            s_diag_txfrs_fail_total = 0;
+        }
+    }
+
+    /* === Slots 1..UWB_MAX_PERIPHERALS: sweep peripherals. ===
+     * We immediately re-enable RX after the beacon TX completes. The
+     * peripherals' Polls land in their assigned slots; this loop just
+     * processes them as they arrive. The hw RX timeout on each slot
+     * (POLL_RX_TIMEOUT_PER_SLOT_UUS) keeps the loop from blocking
+     * indefinitely on a quiet slot. */
+    int ok_count = 0;
+    for (int slot = 1; slot <= UWB_MAX_PERIPHERALS; slot++) {
+        /* The peripheral assigned to this slot has suffix 'A' + (slot-1). */
+        s_peer_addr_lo = ADDR_PERIPH_PREFIX;
+        s_peer_addr_hi = (uint8_t)('A' + (slot - 1));
+
+        bool slot_ok = main_handle_one_slot(&results[slot - 1]);
+        if (slot_ok) {
+            ok_count++;
+        }
+        /* main_handle_one_slot leaves the radio in IDLE on both paths,
+         * so we can re-enter the next slot's RX immediately. */
+    }
+
+    /* Track miss-streaks per ROUND rather than per slot — a "round" is
+     * the unit of progress at this layer. If no peripheral responded at
+     * all, that's a real miss. If at least one did, the round was
+     * useful. */
+    uwb_handle_cycle_result(ok_count > 0);
+
+    s_round_counter++;
+
+    static int round_log = 0;
+    if (round_log++ % 10 == 0) {
+        ESP_LOGI(TAG, "Round %lu: %d/%d slots OK",
+                 (unsigned long)s_round_counter, ok_count, UWB_MAX_PERIPHERALS);
+    }
+
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------------------- */
+/* PERIPHERAL: one TDMA cycle (wait beacon, schedule Poll, exchange)     */
+/* --------------------------------------------------------------------- */
+
+static esp_err_t peripheral_cycle_tdma(uwb_range_result_t *result)
+{
+    /* Optimistic: if any failure path runs, it'll overwrite this. */
+    s_last_miss_reason = UWB_MISS_OTHER;
+
+    uwb_proactive_recal_if_due();
+
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
+                       | SYS_STATUS_TXFRB_BIT_MASK
+                       | SYS_STATUS_TXPRS_BIT_MASK
+                       | SYS_STATUS_TXPHS_BIT_MASK
+                       | SYS_STATUS_RX_ANY);
+
+    /* === 1. Wait for the beacon. ===
+     * Use a hardware RX timeout sized to TWO full rounds so a single
+     * missed beacon doesn't permanently desync. */
+    dwt_setrxaftertxdelay(0);
+    /* RX timeout in uus; cap to ~16-bit because the register is 24-bit on
+     * DW3000 but conservative caps prevent surprise on the driver port. */
+    uint32_t beacon_rx_to_uus = (BEACON_RX_TIMEOUT_US * 1000UL) / 1026UL; /* ~1.0256 us per uus */
+    if (beacon_rx_to_uus > 0xFFFFFFUL) beacon_rx_to_uus = 0xFFFFFFUL;
+    dwt_setrxtimeout(beacon_rx_to_uus);
+
+    if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
+        ESP_LOGE(TAG, "beacon rxenable failed");
+        return ESP_FAIL;
+    }
+
+    uint32_t status = wait_rx_event(BEACON_RX_TIMEOUT_US + 5000);
+
+    /* Count anything the RX did — good or bad — so we can tell whether
+     * the chip is seeing energy at all. */
+    if (status & SYS_STATUS_RXFCG_BIT_MASK)                       s_rx_good_count++;
+    if (status & (SYS_STATUS_RXFCG_BIT_MASK
+                | SYS_STATUS_ALL_RX_TO
+                | SYS_STATUS_ALL_RX_ERR))                          s_rx_event_count++;
+
+    /* Periodic diagnostic. The key signal:
+     *   - rx_event_count grows but rx_good_count stays low → RF energy is
+     *     reaching the chip, but frames aren't decoding. Look at channel,
+     *     preamble code, or interference.
+     *   - both stay low/zero → the chip isn't seeing energy at all.
+     *     Look at antenna, distance, or whether the main is actually TXing.
+     *   - both grow but s_ever_linked still false → packets received but
+     *     not from the expected source (PAN ID / address filter).
+     *
+     * (CPLOCK isn't reported here — it's an edge bit, not a level, so
+     * reading it later always shows "unlocked" even on a healthy radio.
+     * Use the beacons OK/FAIL counter on the main side for real PLL
+     * health, or just observe whether RX events keep accumulating.) */
+    int64_t now_us = esp_timer_get_time();
+    if (s_last_diag_log_us == 0) s_last_diag_log_us = now_us;
+    if (now_us - s_last_diag_log_us >= RX_DIAG_INTERVAL_US) {
+        ESP_LOGI(TAG, "RX diag: events=%lu  good=%lu  linked=%s",
+                 (unsigned long)s_rx_event_count,
+                 (unsigned long)s_rx_good_count,
+                 s_ever_linked ? "yes" : "NO");
+        s_last_diag_log_us = now_us;
+    }
+
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+        s_last_miss_reason = UWB_MISS_NO_BEACON;
+        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        }
+        static int bmiss = 0;
+        if (bmiss < 5 || bmiss % 20 == 0) {
+            ESP_LOGW(TAG, "Beacon RX miss #%d (status=0x%08lX)",
+                     bmiss, (unsigned long)status);
+        }
+        bmiss++;
         dwt_forcetrxoff();
         return ESP_OK;
     }
     dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
 
-    /* === 3. Validate Response and extract timestamps. === */
+    /* === 2. Validate beacon. === */
     uint8_t  ranging_bit = 0;
     uint16_t flen = dwt_getframelength(&ranging_bit);
-    if (flen != RESP_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
-        ESP_LOGW(TAG, "Resp wrong length %u", flen);
-        return ESP_OK;
-    }
-    dwt_readrxdata(rx_buf, RESP_FRAME_LEN, 0);
-    if (!header_ok(rx_buf, FN_RESPONSE)) {
-        ESP_LOGW(TAG, "Resp header mismatch (fn=0x%02X)", rx_buf[9]);
-        return ESP_OK;
-    }
+    if (flen != BEACON_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
+    dwt_readrxdata(rx_buf, BEACON_FRAME_LEN, 0);
+    if (!beacon_header_ok(rx_buf)) return ESP_OK;
 
-    uint64_t poll_tx_ts = get_tx_timestamp_u64();
-    uint64_t resp_rx_ts = get_rx_timestamp_u64();
-    uint64_t poll_rx_ts = ts_from_frame(&rx_buf[RESP_POLL_RX_TS_IDX]);
-    uint64_t resp_tx_ts = ts_from_frame(&rx_buf[RESP_RESP_TX_TS_IDX]);
-
-    /* Periodic diagnostic — much less frequent now that protocol is working. */
-    static int resp_dbg = 0;
-    if (resp_dbg++ % 100 == 0) {
-        ESP_LOGI(TAG, "Resp ts: poll_rx=%llu resp_tx=%llu",
-                 (unsigned long long)poll_rx_ts, (unsigned long long)resp_tx_ts);
+    /* Got a valid beacon from the main. Latch the linked state — from now
+     * on, beacon misses are real problems worth recalibrating for. The
+     * first transition gets a prominent log so the user can see the link
+     * came up. */
+    if (!s_ever_linked) {
+        ESP_LOGI(TAG, "*** Linked to main *** (first beacon RX in slot %u)",
+                 s_my_slot_index);
+        s_ever_linked = true;
     }
 
-    /* === 4. Schedule Final TX and embed all three local timestamps. ===
+    uint64_t beacon_rx_ts = get_rx_timestamp_u64();
+
+    /* Snapshot host time at the start of "the work" so we can measure the
+     * end-to-end host latency from beacon-validated to starttx-called.
+     * That latency is what PERIPHERAL_POLL_LEAD_US must exceed. */
+    int64_t host_t0_us = esp_timer_get_time();
+
+    /* === 3. Schedule Poll TX at our slot offset from the beacon. ===
      *
-     * Same ordering as the responder: set RX-after-TX config first (it
-     * applies post-TX), then build and write the frame, then the time-
-     * critical setdelayedtrxtime → starttx pair. */
+     * Slot 1 starts at 0 ms after beacon (main's listen window for slot 1
+     * opens immediately when slot loop begins). We add a small lead time
+     * to push the actual Poll TX a few ms into the window, which gives
+     * the main side a chance to finish entering RX after the beacon TX
+     * completes. Slot N (1..15) -> offset (N-1) × SLOT_WIDTH + lead.
+     *
+     * The slot offset uses 64-bit arithmetic before shifting because the
+     * raw tick count exceeds 32 bits for the later slots. Forgetting this
+     * is a common source of "delayed TX fires immediately because the
+     * scheduled time wrapped" bugs. */
+    uint32_t slot_offset_us = (uint32_t)(s_my_slot_index - 1)
+                            * (uint32_t)UWB_SLOT_WIDTH_MS
+                            * 1000U
+                            + PERIPHERAL_POLL_LEAD_US;
+    uint64_t slot_offset_ticks = (uint64_t)slot_offset_us * UUS_TO_DWT_TIME;
 
-    dwt_setrxaftertxdelay(FINAL_TX_TO_REPORT_RX_DLY_UUS);
-    dwt_setrxtimeout(REPORT_RX_TIMEOUT_UUS);
+    uint32_t poll_tx_time = (uint32_t)((beacon_rx_ts + slot_offset_ticks) >> 8);
+    uint64_t poll_tx_ts   = (((uint64_t)(poll_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+    (void)poll_tx_ts;  /* read back from get_tx_timestamp_u64 after TX completes */
 
+    /* Build Poll. */
+    uint8_t poll[POLL_FRAME_LEN];
+    s_seq++;
+    fill_header(poll, FN_POLL,
+                s_peer_addr_lo, s_peer_addr_hi,
+                s_my_addr_lo, s_my_addr_hi);
+    dwt_writetxdata(POLL_FRAME_LEN, poll, 0);
+    dwt_writetxfctrl(POLL_FRAME_LEN + FCS_LEN, 0, 1);
+
+    /* Set up the RX-after-TX window for the Response BEFORE arming the
+     * delayed TX. */
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+
+    dwt_setdelayedtrxtime(poll_tx_time);
+
+    /* Measure host latency right before the critical starttx call. */
+    int64_t host_t1_us = esp_timer_get_time();
+    int64_t host_elapsed_us = host_t1_us - host_t0_us;
+
+    /* DW3000 errata workaround: stale RX timeout/error status bits cause
+     * dwt_starttx(DELAYED) to spuriously return DWT_ERROR even when the
+     * scheduled time is far in the future. Clear them right before the
+     * call. See Qorvo forum 21963 (Pirmin's finding, Mar 2025).
+     *
+     * This was the root cause of the "Poll TX late/cancelled" failures
+     * we were seeing with 269 us host latency vs 5000 us lead — the chip
+     * wasn't refusing because of timing, it was refusing because stale
+     * RX-FTO bits from previous cycles were latched. */
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+
+    int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+    if (txret != DWT_SUCCESS) {
+        /* dwt_starttx returned DWT_ERROR. Two possible causes:
+         *   1. Scheduled time has actually passed (host took > lead).
+         *      Distinguishable: host_elapsed_us > PERIPHERAL_POLL_LEAD_US.
+         *   2. Stale RX-FTO/error bits or other internal state (errata).
+         *      We just cleared the known-problematic ones above, but some
+         *      other latched condition may still bite. Distinguishable:
+         *      host_elapsed_us << PERIPHERAL_POLL_LEAD_US.
+         *
+         * The log message distinguishes between them so you know which
+         * knob to turn (or whether it's something new to investigate). */
+        s_last_miss_reason = UWB_MISS_POLL_LATE;
+        static int late_log = 0;
+        if (late_log < 5 || late_log % 50 == 0) {
+            const char *likely = (host_elapsed_us > PERIPHERAL_POLL_LEAD_US - 500)
+                                ? "host too slow — bump PERIPHERAL_POLL_LEAD_US"
+                                : "chip refused despite ample time — stale status bits?";
+            ESP_LOGW(TAG, "Poll TX cancelled #%d (slot %u): "
+                          "host=%lld us lead=%d us — %s",
+                     late_log, s_my_slot_index,
+                     (long long)host_elapsed_us,
+                     PERIPHERAL_POLL_LEAD_US,
+                     likely);
+        }
+        late_log++;
+        dwt_forcetrxoff();
+        return ESP_OK;
+    }
+
+    /* Successful arm. Log the host latency occasionally so we can see how
+     * close we are to the limit during normal operation. */
+    static int arm_log_count = 0;
+    if (arm_log_count++ % 50 == 0) {
+        ESP_LOGI(TAG, "Poll armed OK (slot %u): host=%lld us, lead=%d us, margin=%lld us",
+                 s_my_slot_index,
+                 (long long)host_elapsed_us,
+                 PERIPHERAL_POLL_LEAD_US,
+                 (long long)(PERIPHERAL_POLL_LEAD_US - host_elapsed_us));
+    }
+
+    /* === 4. Wait for Response RX. === */
+    status = wait_rx_event(15000);
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        }
+        static int rmiss = 0;
+        if (rmiss < 5 || rmiss % 50 == 0) {
+            ESP_LOGW(TAG, "Resp RX miss #%d (status=0x%08lX)",
+                     rmiss, (unsigned long)status);
+        }
+        rmiss++;
+        dwt_forcetrxoff();
+        return ESP_OK;
+    }
+    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
+
+    /* === 5. Validate Response. === */
+    flen = dwt_getframelength(&ranging_bit);
+    if (flen != RESP_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
+    dwt_readrxdata(rx_buf, RESP_FRAME_LEN, 0);
+    if (!header_ok(rx_buf, FN_RESPONSE)) return ESP_OK;
+
+    uint64_t poll_tx_ts_actual = get_tx_timestamp_u64();
+    uint64_t resp_rx_ts        = get_rx_timestamp_u64();
+    /* poll_rx_ts and resp_tx_ts also live in the Response payload but
+     * the peripheral doesn't use them — only the main needs them, and
+     * the main has its own local copies. */
+
+    /* === 6. Schedule Final TX with timestamps + IMU. ===
+     * Fire-and-forget — there's no frame after this one in the slot. */
     uint32_t final_tx_time = (uint32_t)((resp_rx_ts +
                                          (RESP_RX_TO_FINAL_TX_DLY_UUS * UUS_TO_DWT_TIME))
                                         >> 8);
@@ -446,336 +1050,10 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
     fill_header(final_frame, FN_FINAL,
                 s_peer_addr_lo, s_peer_addr_hi,
                 s_my_addr_lo, s_my_addr_hi);
-    ts_to_frame(&final_frame[FINAL_POLL_TX_TS_IDX],  poll_tx_ts);
+    ts_to_frame(&final_frame[FINAL_POLL_TX_TS_IDX],  poll_tx_ts_actual);
     ts_to_frame(&final_frame[FINAL_RESP_RX_TS_IDX],  resp_rx_ts);
     ts_to_frame(&final_frame[FINAL_FINAL_TX_TS_IDX], final_tx_ts);
 
-    dwt_writetxdata(FINAL_FRAME_LEN, final_frame, 0);
-    dwt_writetxfctrl(FINAL_FRAME_LEN + FCS_LEN, 0, 1);
-
-    dwt_setdelayedtrxtime(final_tx_time);
-
-    int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-    if (txret != DWT_SUCCESS) {
-        /* Same workaround as on responder: HPDWARN trips spuriously, but
-         * TX often fires anyway. Poll for TXFRS to determine actual fate. */
-        bool tx_fired = false;
-        int waited = 0;
-        while (waited < 8000) {
-            if (dwt_readsysstatuslo() & SYS_STATUS_TXFRS_BIT_MASK) {
-                tx_fired = true;
-                break;
-            }
-            esp_rom_delay_us(50);
-            waited += 50;
-        }
-        static int late_log = 0;
-        if (late_log < 5 || late_log % 100 == 0) {
-            ESP_LOGW(TAG, "Final TX driver-error #%d (fired=%d)",
-                     late_log, tx_fired ? 1 : 0);
-        }
-        late_log++;
-        if (!tx_fired) {
-            dwt_forcetrxoff();
-            return ESP_OK;
-        }
-        dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
-    }
-
-    /* === 5. Wait for Report RX. === */
-    status = wait_rx_event(15000);
-    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
-        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-        }
-        static int rep_miss = 0;
-        if (rep_miss++ % 20 == 0) {
-            ESP_LOGW(TAG, "Report RX miss (status=0x%08lX)", (unsigned long)status);
-        }
-        dwt_forcetrxoff();
-        return ESP_OK;
-    }
-    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
-
-    /* === 6. Validate Report and extract distance. === */
-    flen = dwt_getframelength(&ranging_bit);
-    if (flen != REPORT_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
-        static int rep_len_log = 0;
-        if (rep_len_log++ < 5) {
-            ESP_LOGW(TAG, "Report wrong length %u (expected %d)",
-                     flen, REPORT_FRAME_LEN + FCS_LEN);
-        }
-        return ESP_OK;
-    }
-    dwt_readrxdata(rx_buf, REPORT_FRAME_LEN, 0);
-
-    if (!header_ok(rx_buf, FN_REPORT)) {
-        static int rep_hdr_log = 0;
-        if (rep_hdr_log++ < 5) {
-            ESP_LOGW(TAG, "Report header mismatch: fn=0x%02X expected 0x%02X",
-                     rx_buf[9], FN_REPORT);
-        }
-        return ESP_OK;
-    }
-
-    int32_t distance_mm = (int32_t)((uint32_t)rx_buf[REPORT_DIST_IDX + 0]
-                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 1] << 8)
-                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 2] << 16)
-                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 3] << 24));
-    double distance_m = distance_mm / 1000.0;
-
-    if (distance_m < -1.0 || distance_m > 500.0) {
-        static int sane_log = 0;
-        if (sane_log++ % 20 == 0) {
-            ESP_LOGW(TAG, "Insane reported distance %.3f m", distance_m);
-        }
-        return ESP_OK;
-    }
-
-    if (result) {
-        result->distance_m   = (float)(distance_m - g_uwb_distance_offset_m);
-        result->timestamp_us = esp_timer_get_time();
-        result->valid        = true;
-
-        /* Pull the responder's IMU sample out of the Report. The bytes
-         * are all 0xFF if the responder hadn't published a sample yet —
-         * detect that and mark invalid. */
-        bool all_ff = true;
-        for (size_t i = 0; i < sizeof(lsm6_sample_t); i++) {
-            if (rx_buf[REPORT_IMU_IDX + i] != 0xFF) { all_ff = false; break; }
-        }
-        if (!all_ff) {
-            memcpy(&result->peer_imu, &rx_buf[REPORT_IMU_IDX],
-                   sizeof(result->peer_imu));
-            result->peer_imu_valid = true;
-        } else {
-            result->peer_imu_valid = false;
-        }
-    }
-
-    /* Periodic confirmation. */
-    static int success_count = 0;
-    success_count++;
-    if (success_count % 20 == 1) {
-        ESP_LOGI(TAG, "Range OK #%d d=%.3f m", success_count, result->distance_m);
-    }
-
-    s_seq++;
-    return ESP_OK;
-}
-
-/* --------------------------------------------------------------------- */
-/* Responder                                                              */
-/* --------------------------------------------------------------------- */
-
-static esp_err_t responder_cycle(uwb_range_result_t *result)
-{
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
-                       | SYS_STATUS_TXFRB_BIT_MASK
-                       | SYS_STATUS_TXPRS_BIT_MASK
-                       | SYS_STATUS_TXPHS_BIT_MASK
-                       | SYS_STATUS_RX_ANY);
-
-    /* === 1. Listen for Poll. === */
-    dwt_setrxaftertxdelay(0);
-    dwt_setrxtimeout(0);
-    if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
-        ESP_LOGE(TAG, "rxenable failed");
-        return ESP_FAIL;
-    }
-
-    uint32_t status = wait_rx_event(150000);
-    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
-        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-        }
-        static int poll_miss = 0;
-        if (poll_miss < 5 || poll_miss % 50 == 0) {
-            ESP_LOGW(TAG, "Poll RX miss #%d (status=0x%08lX)", poll_miss, (unsigned long)status);
-        }
-        poll_miss++;
-        dwt_forcetrxoff();
-        return ESP_OK;
-    }
-    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
-
-    /* === 2. Validate Poll. === */
-    uint8_t  ranging_bit = 0;
-    uint16_t flen = dwt_getframelength(&ranging_bit);
-    if (flen != POLL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
-    dwt_readrxdata(rx_buf, POLL_FRAME_LEN, 0);
-    if (!header_ok(rx_buf, FN_POLL)) return ESP_OK;
-    uint8_t peer_seq = rx_buf[2];
-
-    static int poll_rx_count = 0;
-    poll_rx_count++;
-    if (poll_rx_count % 20 == 1) {
-        ESP_LOGI(TAG, "Poll RX #%d (seq=%u)", poll_rx_count, peer_seq);
-    }
-
-    /* === 3. Schedule Response TX (with embedded poll_rx_ts, resp_tx_ts). ===
-     *
-     * Order of operations matters here: setdelayedtrxtime → starttx must
-     * happen with minimal SPI in between, because the chip evaluates the
-     * scheduled time against its current system time at starttx. Set up
-     * RX-after-TX config FIRST (it only takes effect after TX completes,
-     * so timing doesn't matter), then build the frame and write it, then
-     * do the time-critical setdelayedtrxtime → starttx sequence. */
-
-    /* Set up RX-after-TX first — these don't affect TX scheduling timing. */
-    dwt_setrxaftertxdelay(RESP_TX_TO_FINAL_RX_DLY_UUS);
-    dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
-
-    int64_t t_before_sched_us = esp_timer_get_time();
-    uint64_t poll_rx_ts = get_rx_timestamp_u64();
-    uint32_t resp_tx_time = (uint32_t)((poll_rx_ts +
-                                        (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME))
-                                       >> 8);
-    uint64_t resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
-
-    /* Build the Response frame BEFORE we set the delayed TX time, so the
-     * time-critical window between setdelayedtrxtime and starttx is tight. */
-    uint8_t resp[RESP_FRAME_LEN];
-    s_seq = peer_seq;
-    fill_header(resp, FN_RESPONSE,
-                ADDR_INIT_LO, ADDR_INIT_HI,
-                s_my_addr_lo, s_my_addr_hi);
-    ts_to_frame(&resp[RESP_POLL_RX_TS_IDX], poll_rx_ts);
-    ts_to_frame(&resp[RESP_RESP_TX_TS_IDX], resp_tx_ts);
-
-    dwt_writetxdata(RESP_FRAME_LEN, resp, 0);
-    dwt_writetxfctrl(RESP_FRAME_LEN + FCS_LEN, 0, 1);
-
-    /* Now the tight window: setdelayedtrxtime → starttx. */
-    dwt_setdelayedtrxtime(resp_tx_time);
-
-    int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-    int64_t t_after_sched_us = esp_timer_get_time();
-    int64_t sched_elapsed_us = t_after_sched_us - t_before_sched_us;
-
-    static int sched_diag = 0;
-    if (sched_diag++ < 5) {
-        ESP_LOGI(TAG, "Resp TX sched host time: %lld us (delay budget %u uus)",
-                 (long long)sched_elapsed_us,
-                 (unsigned)POLL_RX_TO_RESP_TX_DLY_UUS);
-    }
-
-    if (txret != DWT_SUCCESS) {
-        /* On this chip/driver, HPDWARN trips spuriously even with ample
-         * scheduling margin. The driver attempts to cancel via CMD_TXRXOFF
-         * but the cancel races with the TX preamble start and frequently
-         * loses — TX fires anyway. Poll for TXFRS to detect actual fire.
-         * If TXFRS arrives within a few ms, the TX really did happen with
-         * the embedded timestamps we set; the initiator will receive it
-         * correctly and the cycle continues. */
-        bool tx_fired = false;
-        int waited = 0;
-        while (waited < 8000) {  /* 8 ms covers worst-case delay + air time */
-            if (dwt_readsysstatuslo() & SYS_STATUS_TXFRS_BIT_MASK) {
-                tx_fired = true;
-                break;
-            }
-            esp_rom_delay_us(50);
-            waited += 50;
-        }
-        static int late_log = 0;
-        if (late_log < 5 || late_log % 100 == 0) {
-            ESP_LOGW(TAG, "Resp TX driver-error #%d (host %lld us, fired=%d)",
-                     late_log, (long long)sched_elapsed_us, tx_fired ? 1 : 0);
-        }
-        late_log++;
-        if (!tx_fired) {
-            /* Genuine cancel — TX did not happen. Abort cycle. */
-            dwt_forcetrxoff();
-            return ESP_OK;
-        }
-        /* TX did fire. Clear the TXFRS bit and continue. */
-        dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
-    }
-
-    /* === 4. Wait for Final RX. ===
-     * Software timeout exceeds hardware FINAL_RX_TIMEOUT_UUS plus detection
-     * jitter. */
-    status = wait_rx_event(20000);
-    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
-        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-        }
-        static int final_miss = 0;
-        if (final_miss < 5 || final_miss % 20 == 0) {
-            ESP_LOGW(TAG, "Final RX miss #%d (status=0x%08lX)",
-                     final_miss, (unsigned long)status);
-        }
-        final_miss++;
-        dwt_forcetrxoff();
-        return ESP_OK;
-    }
-    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
-
-    /* === 5. Validate Final and read embedded timestamps. === */
-    flen = dwt_getframelength(&ranging_bit);
-    if (flen != FINAL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
-    dwt_readrxdata(rx_buf, FINAL_FRAME_LEN, 0);
-    if (!header_ok(rx_buf, FN_FINAL)) return ESP_OK;
-
-    uint64_t poll_tx_ts  = ts_from_frame(&rx_buf[FINAL_POLL_TX_TS_IDX]);
-    uint64_t resp_rx_ts  = ts_from_frame(&rx_buf[FINAL_RESP_RX_TS_IDX]);
-    uint64_t final_tx_ts = ts_from_frame(&rx_buf[FINAL_FINAL_TX_TS_IDX]);
-    uint64_t final_rx_ts = get_rx_timestamp_u64();
-
-    /* === 6. Compute DS-TWR distance. === */
-    double distance_m = dstwr_distance_m(poll_tx_ts, resp_rx_ts, final_tx_ts,
-                                         poll_rx_ts, resp_tx_ts, final_rx_ts);
-
-    /* Periodic timestamp diagnostic, like SS-TWR. */
-    static int diag_count = 0;
-    if (diag_count++ % 30 == 0) {
-        uint32_t Ra = (uint32_t)(resp_rx_ts  - poll_tx_ts);
-        uint32_t Rb = (uint32_t)(final_rx_ts - resp_tx_ts);
-        uint32_t Da = (uint32_t)(final_tx_ts - resp_rx_ts);
-        uint32_t Db = (uint32_t)(resp_tx_ts  - poll_rx_ts);
-        ESP_LOGI(TAG, "TS: pT=%llu pR=%llu rT=%llu rR=%llu fT=%llu fR=%llu",
-                 (unsigned long long)poll_tx_ts,
-                 (unsigned long long)poll_rx_ts,
-                 (unsigned long long)resp_tx_ts,
-                 (unsigned long long)resp_rx_ts,
-                 (unsigned long long)final_tx_ts,
-                 (unsigned long long)final_rx_ts);
-        ESP_LOGI(TAG, "    Ra=%lu Rb=%lu Da=%lu Db=%lu d=%.3f m",
-                 (unsigned long)Ra, (unsigned long)Rb,
-                 (unsigned long)Da, (unsigned long)Db, distance_m);
-    }
-
-    if (distance_m < -1.0 || distance_m > 500.0) {
-        static int sane_log = 0;
-        if (sane_log++ % 20 == 0) {
-            ESP_LOGW(TAG, "Insane DS-TWR distance %.3f m", distance_m);
-        }
-        dwt_forcetrxoff();
-        return ESP_OK;
-    }
-
-    /* Apply offset and store locally. */
-    double distance_m_calibrated = distance_m - g_uwb_distance_offset_m;
-    if (result) {
-        result->distance_m   = (float)distance_m_calibrated;
-        result->timestamp_us = esp_timer_get_time();
-        result->valid        = true;
-    }
-
-    /* === 7. Send Report back so the initiator knows the distance too. === */
-    int32_t distance_mm = (int32_t)(distance_m_calibrated * 1000.0);
-    uint8_t report[REPORT_FRAME_LEN];
-    fill_header(report, FN_REPORT,
-                ADDR_INIT_LO, ADDR_INIT_HI,
-                s_my_addr_lo, s_my_addr_hi);
-    report[REPORT_DIST_IDX + 0] = (uint8_t)(distance_mm);
-    report[REPORT_DIST_IDX + 1] = (uint8_t)(distance_mm >> 8);
-    report[REPORT_DIST_IDX + 2] = (uint8_t)(distance_mm >> 16);
-    report[REPORT_DIST_IDX + 3] = (uint8_t)(distance_mm >> 24);
-
-    /* Snapshot the latest local IMU sample (if any) into the Report. */
     lsm6_sample_t imu_snap;
     bool imu_snap_valid;
     portENTER_CRITICAL(&s_imu_lock);
@@ -783,28 +1061,54 @@ static esp_err_t responder_cycle(uwb_range_result_t *result)
     imu_snap_valid = s_local_imu_valid;
     portEXIT_CRITICAL(&s_imu_lock);
     if (imu_snap_valid) {
-        memcpy(&report[REPORT_IMU_IDX], &imu_snap, sizeof(imu_snap));
+        memcpy(&final_frame[FINAL_IMU_IDX], &imu_snap, sizeof(imu_snap));
     } else {
-        /* Zero the IMU bytes so the initiator can detect "no sample yet"
-         * via a known sentinel. We use NaN in the first float as the
-         * "invalid" signal (zero would be ambiguous with a real reading
-         * of motionless sensor at rest). */
-        memset(&report[REPORT_IMU_IDX], 0xFF, sizeof(imu_snap));
+        memset(&final_frame[FINAL_IMU_IDX], 0xFF, sizeof(imu_snap));
     }
 
-    dwt_writetxdata(REPORT_FRAME_LEN, report, 0);
-    dwt_writetxfctrl(REPORT_FRAME_LEN + FCS_LEN, 0, 1);
+    dwt_writetxdata(FINAL_FRAME_LEN, final_frame, 0);
+    dwt_writetxfctrl(FINAL_FRAME_LEN + FCS_LEN, 0, 1);
+    dwt_setdelayedtrxtime(final_tx_time);
 
-    /* Report is fire-and-forget; no RX after. */
-    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
-        ESP_LOGW(TAG, "Report TX start failed");
+    /* DW3000 errata workaround (same as Poll TX): clear stale RX status
+     * bits or dwt_starttx(DELAYED) may spuriously return DWT_ERROR. */
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+        static int late_log = 0;
+        if (late_log < 5 || late_log % 50 == 0) {
+            ESP_LOGW(TAG, "Final TX late/cancelled #%d", late_log);
+        }
+        late_log++;
+        dwt_forcetrxoff();
         return ESP_OK;
     }
-    if (!wait_txfrs(3000)) {
-        ESP_LOGW(TAG, "Report TXFRS timeout");
+
+    if (!wait_txfrs(5000)) {
+        static int fmiss = 0;
+        if (fmiss < 5 || fmiss % 50 == 0) {
+            ESP_LOGW(TAG, "Final TXFRS timeout #%d", fmiss);
+        }
+        fmiss++;
+        dwt_forcetrxoff();
+        return ESP_OK;
     }
 
+    if (result) {
+        result->valid        = true;
+        result->distance_m   = 0.0f;
+        result->timestamp_us = esp_timer_get_time();
+    }
+    s_last_miss_reason = UWB_MISS_NONE;
+
+    static int success_count = 0;
+    success_count++;
+    if (success_count % 50 == 1) {
+        ESP_LOGI(TAG, "Peripheral cycle OK #%d (slot %u, Final sent)",
+                 success_count, s_my_slot_index);
+    }
+
+    dwt_forcetrxoff();
     return ESP_OK;
 }
 
@@ -813,30 +1117,34 @@ static esp_err_t responder_cycle(uwb_range_result_t *result)
 /* --------------------------------------------------------------------- */
 
 esp_err_t uwb_init(uwb_role_t role,
-                   char responder_addr_suffix,
+                   char peripheral_addr_suffix,
                    int mosi, int miso, int sclk, int cs, int rst)
 {
     s_role = role;
 
-    /* Validate / normalise the responder suffix. Accept 'A'..'I' (9 max).
-     * Anything else (including 0) becomes the default 'A'. */
-    char suffix = responder_addr_suffix;
-    if (suffix < 'A' || suffix > 'I') suffix = DEFAULT_RESP_SUFFIX;
+    /* Suffix range is 'A'..'A' + UWB_MAX_PERIPHERALS - 1 = 'A'..'O' for
+     * the default 15 peripherals. Anything outside that range (including
+     * 0) falls back to 'A' / slot 1. */
+    const char max_suffix = 'A' + UWB_MAX_PERIPHERALS - 1;
+    char suffix = peripheral_addr_suffix;
+    if (suffix < 'A' || suffix > max_suffix) suffix = DEFAULT_PERIPH_SUFFIX;
 
-    if (role == UWB_ROLE_INITIATOR) {
-        s_my_addr_lo   = ADDR_INIT_LO;     s_my_addr_hi   = ADDR_INIT_HI;
-        /* Peer addr will be set per-cycle by uwb_perform_ranging. Initialise
-         * to the default (single-peer compatibility) so logs read sensibly
-         * before the first ranging call. */
-        s_peer_addr_lo = ADDR_RESP_PREFIX; s_peer_addr_hi = DEFAULT_RESP_SUFFIX;
+    if (role == UWB_ROLE_MAIN) {
+        s_my_addr_lo    = ADDR_MAIN_LO;       s_my_addr_hi    = ADDR_MAIN_HI;
+        /* Peer addr is set per-slot inside main_round_tdma. Default it
+         * to slot 1 so logs read sensibly before the first round. */
+        s_peer_addr_lo  = ADDR_PERIPH_PREFIX; s_peer_addr_hi  = DEFAULT_PERIPH_SUFFIX;
+        s_my_slot_index = 0;
     } else {
-        s_my_addr_lo   = ADDR_RESP_PREFIX; s_my_addr_hi   = suffix;
-        s_peer_addr_lo = ADDR_INIT_LO;     s_peer_addr_hi = ADDR_INIT_HI;
+        s_my_addr_lo    = ADDR_PERIPH_PREFIX; s_my_addr_hi    = suffix;
+        s_peer_addr_lo  = ADDR_MAIN_LO;       s_peer_addr_hi  = ADDR_MAIN_HI;
+        s_my_slot_index = (uint8_t)(suffix - 'A' + 1);   /* 1..15 */
     }
-    ESP_LOGI(TAG, "Init UWB role=%s addr=%c%c peer=%c%c (DS-TWR)",
-             role == UWB_ROLE_INITIATOR ? "initiator" : "responder",
+    ESP_LOGI(TAG, "Init UWB role=%s addr=%c%c peer=%c%c slot=%u (TDMA, %d slots)",
+             role == UWB_ROLE_MAIN ? "main" : "peripheral",
              s_my_addr_lo, s_my_addr_hi,
-             s_peer_addr_lo, s_peer_addr_hi);
+             s_peer_addr_lo, s_peer_addr_hi,
+             s_my_slot_index, UWB_MAX_PERIPHERALS);
 
     esp_err_t err = dwm3000_init(mosi, miso, sclk, cs, rst);
     if (err != ESP_OK) return err;
@@ -848,6 +1156,7 @@ esp_err_t uwb_init(uwb_role_t role,
         ESP_LOGE(TAG, "Wrong DEV_ID: 0x%08lX", (unsigned long)dev_id);
         return ESP_FAIL;
     }
+    dwt_setpllcaltemperature(TEMP_INIT);
 
     if (dwt_configure((dwt_config_t *)&s_uwb_config) != DWT_SUCCESS) {
         ESP_LOGE(TAG, "dwt_configure failed");
@@ -858,43 +1167,31 @@ esp_err_t uwb_init(uwb_role_t role,
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
-    ESP_LOGI(TAG, "UWB ready (chan 5, PLEN 64, 6.8 Mbps, DS-TWR)");
+    ESP_LOGI(TAG, "UWB ready (chan 5, PLEN 64, 6.8 Mbps, TDMA DS-TWR)");
     return ESP_OK;
 }
 
-esp_err_t uwb_perform_ranging(char peer_addr_suffix, uwb_range_result_t *result)
+esp_err_t uwb_perform_round(uwb_range_result_t *results)
 {
-    if (result) {
-        result->valid          = false;
-        result->distance_m     = 0.0f;
-        result->timestamp_us   = 0;
-        result->peer_imu_valid = false;
-        /* Don't bother zeroing result->peer_imu — meaningless when invalid. */
+    if (!results) return ESP_FAIL;
+
+    if (s_role == UWB_ROLE_MAIN) {
+        return main_round_tdma(results);
+    } else {
+        /* Peripheral writes only results[0]. Pre-init so the caller's
+         * "success" check is well-defined even if the cycle bails early. */
+        results[0].valid          = false;
+        results[0].distance_m     = 0.0f;
+        results[0].timestamp_us   = 0;
+        results[0].peer_imu_valid = false;
+        esp_err_t e = peripheral_cycle_tdma(&results[0]);
+        uwb_handle_cycle_result(results[0].valid);
+        return e;
     }
-
-    if (s_role == UWB_ROLE_INITIATOR) {
-        /* Validate the peer suffix; fall back to default if junk. The
-         * responder ignores peer_addr_suffix entirely (it only ever
-         * talks to the single initiator 'VE'). */
-        char suffix = peer_addr_suffix;
-        if (suffix < 'A' || suffix > 'I') suffix = DEFAULT_RESP_SUFFIX;
-
-        /* Latch the per-cycle peer addr into the module-static fields that
-         * fill_header and header_ok read. This is safe because
-         * uwb_perform_ranging is called serially from a single task. */
-        s_peer_addr_lo = ADDR_RESP_PREFIX;
-        s_peer_addr_hi = (uint8_t)suffix;
-
-        return initiator_cycle(result);
-    }
-    return responder_cycle(result);
 }
 
 void uwb_publish_local_imu(const lsm6_sample_t *sample)
 {
-    /* Only the responder embeds this into Report frames; initiator-side
-     * calls are accepted but unused. Storing on both sides anyway is
-     * harmless and makes the API role-agnostic. */
     if (!sample) return;
     portENTER_CRITICAL(&s_imu_lock);
     s_local_imu       = *sample;

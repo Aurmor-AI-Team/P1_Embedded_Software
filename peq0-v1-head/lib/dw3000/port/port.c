@@ -11,8 +11,60 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "freertos/event_groups.h"
 
 static const char *TAG = "port";
+
+static TaskHandle_t s_deca_task = NULL;
+
+/* GPIO hard-ISR: no SPI, no logging, just kick the deca task. */
+static void IRAM_ATTR dw_irq_isr(void *arg)
+{
+    BaseType_t hpw = pdFALSE;
+    vTaskNotifyGiveFromISR(s_deca_task, &hpw);
+    if (hpw) portYIELD_FROM_ISR();
+}
+
+/* Runs dwt_isr() in task context. Drains while the line is still high so a
+ * second event that arrives mid-service isn't lost (DW3000 IRQ is level-ish:
+ * it stays asserted until every pending SYS_STATUS source is cleared). */
+static void deca_irq_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        do {
+            process_deca_irq();                 /* -> dwt_isr() */
+        } while (gpio_get_level((gpio_num_t)DW3000_IRQ_PIN));
+    }
+}
+
+esp_err_t port_enable_dw3000_irq(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << DW3000_IRQ_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,   /* IRQ idles LOW */
+        .intr_type    = GPIO_INTR_POSEDGE,
+    };
+    gpio_config(&io);
+
+    if (s_deca_task == NULL) {
+        /* Priority MUST exceed the ranging/uwb task (you have it at 5) so
+         * dwt_isr runs and sets the event bits before the ranging task that
+         * is waiting on them gets scheduled. */
+        xTaskCreate(deca_irq_task, "deca_irq", 4096, NULL, 10, &s_deca_task);
+    }
+    static bool isr_svc = false;
+    if (!isr_svc) { gpio_install_isr_service(0); isr_svc = true; }
+    return gpio_isr_handler_add((gpio_num_t)DW3000_IRQ_PIN, dw_irq_isr, NULL);
+}
+
+/* ===== replace the existing stubs ===== */
+void port_set_dwic_isr(port_dwic_isr_t isr) { s_port_dwic_isr = isr; }
+void port_DisableEXT_IRQ(void) { gpio_intr_disable((gpio_num_t)DW3000_IRQ_PIN); }
+void port_EnableEXT_IRQ(void)  { gpio_intr_enable((gpio_num_t)DW3000_IRQ_PIN); }
+void process_deca_irq(void)    { if (s_port_dwic_isr) s_port_dwic_isr(); }
 
 /* Single SPI device handle. We change clock rate by removing and re-adding
  * the device — this is the pattern Qorvo's reference Nordic port uses, and
