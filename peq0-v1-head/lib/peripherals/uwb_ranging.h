@@ -100,16 +100,6 @@ esp_err_t uwb_init(uwb_role_t role,
  * outcomes live in results[i].valid. */
 esp_err_t uwb_perform_round(uwb_range_result_t *results);
 
-#include "bio_telemetry.h"     /* replaces the lsm6dsv.h include for peer data */
-
-typedef struct {
-    float   distance_m;
-    int64_t timestamp_us;
-    bool    valid;
-
-    bio_telemetry_t peer_bio;        /* was: lsm6_sample_t peer_imu;      */
-    bool            peer_bio_valid;  /* was: bool          peer_imu_valid;*/
-} uwb_range_result_t;
 
 /* Option B: per-sensor setters. Each takes s_bio_lock, writes ONLY its own
  * fields, ORs in ONLY its present-mask bit, and marks the struct valid. Safe
@@ -121,6 +111,7 @@ void uwb_bio_set_resp(uint8_t rate_bpm);
 void uwb_bio_set_eeg(const float band_power[BIO_EEG_BANDS]);  /* relative 0..1 */
 void uwb_bio_set_ecg(uint8_t hr_bpm, uint16_t rmssd_ms, uint8_t flags);
 void uwb_bio_set_emg(const float rms[BIO_EMG_CHANNELS]);      /* normalized   */
+void uwb_bio_set_bia(float resistance_ohm, float reactance_ohm, float phase_angle_deg);
 
 /* Calibration offset subtracted from raw distance (meters). Leave at 0
  * until you've run a known-distance calibration. */

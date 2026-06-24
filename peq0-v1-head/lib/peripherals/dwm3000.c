@@ -13,6 +13,7 @@ static const char *TAG = "dwm3000";
 
 /* Provided by port.c */
 extern spi_device_handle_t g_dw_spi;
+#define PIN_RST  17
 
 /* The pin-config args to dwm3000_init are kept for backward compatibility
  * with main.c, but the actual pins live in port.h. We log a warning if
@@ -45,17 +46,28 @@ esp_err_t dwm3000_reconfigure_recover(const void *uwb_config,
     /* Put the transceiver into a known-idle state first. On this driver
      * dwt_forcetrxoff() only issues CMD_TXRXOFF if not already idle — it does
      * NOT reset the receiver, so the real work is the dwt_configure re-cal. */
+    /* Physical RSTn pulse — same sequence as boot_reset_peripherals().
+    * DW3000 RSTn is active-low AND open-drain: drive it LOW, then release
+    * to high-Z (INPUT) and let the pull-up bring it high. NEVER drive it
+    * high — that can damage the pin and won't reset cleanly. */
+    gpio_set_direction((gpio_num_t) PIN_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));                          /* hold in reset */
+    gpio_set_direction((gpio_num_t)PIN_RST, GPIO_MODE_INPUT);  /* release  */
+    vTaskDelay(pdMS_TO_TICKS(100)); 
     dwt_forcetrxoff();
 
-    /* Force the next dwt_configure() to re-measure die temperature and
-     * recalibrate PLL/RX for it. This is the fix for "works then degrades"
-     * thermal drift: PGF/RX cal must re-run after ~20 °C of change. */
-    dwt_setpllcaltemperature(TEMP_INIT);   /* -127 -> read on-chip sensor */
+    float t = dwm3000_read_temp_c();
+    dwt_setpllcaltemperature((int8_t)t);   /* was 0 */
+    /* ... dwt_configure(...) etc ... */
+    ESP_LOGW(TAG, "recover: reconfiguring + recalibrating (PLL cal T=%.1f C)", t);
+    ESP_LOGW(TAG, "after SET, before configure: PLL cal T=%d C", dwt_getpllcaltemperature());
 
     if (dwt_configure((dwt_config_t *)uwb_config) != DWT_SUCCESS) {
         ESP_LOGW(TAG, "recover: dwt_configure (PGF/RX cal) failed");
         return ESP_FAIL;
     }
+    ESP_LOGW(TAG, "after configure: PLL cal T=%d C", dwt_getpllcaltemperature());
 
     /* Re-apply everything dwt_configure does not: TX RF, antenna delays,
      * LNA/PA. These are lost/irrelevant across a reconfigure but must be
@@ -72,6 +84,16 @@ esp_err_t dwm3000_reconfigure_recover(const void *uwb_config,
 
 esp_err_t dwm3000_hard_recover(void)
 {
+    /* Physical RSTn pulse — same sequence as boot_reset_peripherals().
+    * DW3000 RSTn is active-low AND open-drain: drive it LOW, then release
+    * to high-Z (INPUT) and let the pull-up bring it high. NEVER drive it
+    * high — that can damage the pin and won't reset cleanly. */
+    gpio_set_direction((gpio_num_t) PIN_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));                          /* hold in reset */
+    gpio_set_direction((gpio_num_t)PIN_RST, GPIO_MODE_INPUT);  /* release  */
+    vTaskDelay(pdMS_TO_TICKS(100));                         /* wait for IDLE_RC */
+    /* ...then the existing dwt_initialise() at low SPI rate, then fast rate... */
     dwt_forcetrxoff();
     reset_DWIC();
     vTaskDelay(pdMS_TO_TICKS(50));

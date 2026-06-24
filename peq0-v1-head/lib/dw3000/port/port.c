@@ -17,6 +17,10 @@ static const char *TAG = "port";
 
 static TaskHandle_t s_deca_task = NULL;
 
+static bool s_bus_initialized = false;
+static bool s_current_rate_fast = false;
+static port_dwic_isr_t s_port_dwic_isr = NULL;
+
 /* GPIO hard-ISR: no SPI, no logging, just kick the deca task. */
 static void IRAM_ATTR dw_irq_isr(void *arg)
 {
@@ -71,10 +75,6 @@ void process_deca_irq(void)    { if (s_port_dwic_isr) s_port_dwic_isr(); }
  * it avoids the "two devices, same CS pin" trap that confuses ESP-IDF's
  * driver and causes CS to stop being asserted. */
 spi_device_handle_t g_dw_spi = NULL;
-
-static bool s_bus_initialized = false;
-static bool s_current_rate_fast = false;
-static port_dwic_isr_t s_port_dwic_isr = NULL;
 
 static esp_err_t add_device_at_rate(int hz)
 {
@@ -179,9 +179,5 @@ void Sleep(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 
 /* Stubs — implemented properly in Phase 4 when IRQ-driven RX is added. */
 void wakeup_device_with_io(void) { /* not in deepsleep in Phase 3 */ }
-void port_set_dwic_isr(port_dwic_isr_t isr) { s_port_dwic_isr = isr; }
-void port_DisableEXT_IRQ(void)        { }
-void port_EnableEXT_IRQ(void)         { }
 uint32_t port_GetEXT_IRQStatus(void)  { return 0; }
 uint32_t port_CheckEXT_IRQ(void)      { return 0; }
-void process_deca_irq(void) { if (s_port_dwic_isr) s_port_dwic_isr(); }

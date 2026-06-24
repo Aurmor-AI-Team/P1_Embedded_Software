@@ -14,20 +14,24 @@
  *    PHR mode (dwt_config_t.phrMode = DWT_PHRMODE_STD), the whole frame is
  *    capped at 127 bytes incl. FCS. After the 10-byte header + 15 bytes of
  *    DS-TWR timestamps, ~100 bytes remain. A fully-populated bio_telemetry_t
- *    below is ~50 bytes, so there is generous headroom. If you ever exceed
+ *    below is ~56 bytes, so there is generous headroom. If you ever exceed
  *    ~100 bytes, switch the config to DWT_PHRMODE_EXT (up to 1023 bytes) at a
  *    small air-time cost.
  *
  *  - DERIVED metrics only. This pipe carries computed values (HR, breathing
- *    rate, EEG band energies, ECG HR/HRV, EMG RMS), NOT raw waveforms. Raw
- *    ECG/EMG/EEG/PPG sample streams are 0.5-4 KB/s each and do not fit. If you
- *    need raw signals for the biomech/IK model, log them on-node (flash/SD)
- *    timestamped against the beacon round counter and fuse offline.
+ *    rate, EEG band energies, ECG HR/HRV, EMG RMS, BIA R/Xc/phase), NOT raw
+ *    waveforms. Raw ECG/EMG/EEG/PPG/BIA sweep streams are 0.5-4 KB/s each and
+ *    do not fit. If you need raw signals for the biomech/IK model, log them
+ *    on-node (flash/SD) timestamped against the beacon round counter and fuse
+ *    offline.
  *
  *  - present_mask: each node sets only the bits for sensors it actually has.
  *    The main reads the mask before trusting any field. Adding a new sensor =
  *    add a BIO_HAS_* bit + fields; old firmware ignores unknown bits. Bump
  *    BIO_TELEM_VERSION on any layout change so a mixed fleet can be detected.
+ *    NOTE: appending fields also changes sizeof(bio_telemetry_t), hence the
+ *    Final frame length, so a version mismatch is also a hard length mismatch
+ *    at the RX check -- you MUST reflash every board together after a bump.
  *
  *  - Fixed-point: all multi-byte fields are little-endian (native ESP32, and
  *    matches the ts_to_frame/ts_from_frame helpers already in uwb_ranging.c).
@@ -40,12 +44,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define BIO_TELEM_VERSION  1
+#define BIO_TELEM_VERSION  2   /* bumped: added BIA (R/Xc/phase) -> reflash all */
 
 /* ---- present_mask bits (uint16, room for 16 sensor classes) ------------- */
 #define BIO_HAS_IMU   (1u << 0)   /* low-g accel + gyro + high-g accel + temp */
@@ -54,7 +59,8 @@ extern "C" {
 #define BIO_HAS_EEG   (1u << 3)   /* band energies (delta..gamma)             */
 #define BIO_HAS_ECG   (1u << 4)   /* ECG-derived HR, HRV, status flags        */
 #define BIO_HAS_EMG   (1u << 5)   /* per-channel RMS                          */
-/* bits 6..15 reserved for future sensor classes                            */
+#define BIO_HAS_BIA   (1u << 6)   /* bioimpedance: resistance, reactance, phase */
+/* bits 7..15 reserved for future sensor classes                            */
 
 #define BIO_EEG_BANDS     5       /* delta, theta, alpha, beta, gamma         */
 #define BIO_EMG_CHANNELS  4       /* adjust to your hardware                  */
@@ -66,6 +72,8 @@ extern "C" {
 #define BIO_TEMP_LSB_PER_C      100.0f   /* int16, deg C * 100                */
 #define BIO_EEG_LSB_PER_UNIT   1000.0f   /* uint16, relative power 0..1 -> 0..1000 */
 #define BIO_EMG_LSB_PER_UNIT   1000.0f   /* int16, normalized RMS * 1000 (define your unit) */
+#define BIO_BIA_LSB_PER_OHM      10.0f   /* uint16, ohms * 10  -> 0..6553.5 ohm, 0.1 ohm res */
+#define BIO_BIA_LSB_PER_DEG     100.0f   /* uint16, deg * 100  -> 0..655.35 deg, 0.01 deg res */
 
 /* Sentinels for "field present in struct but value not available". */
 #define BIO_U8_NA   0xFFu
@@ -101,6 +109,18 @@ typedef struct {
 
     /* ---- EMG (BIO_HAS_EMG) ---- */
     int16_t  emg_rms[BIO_EMG_CHANNELS]; /* per-channel RMS, BIO_EMG_LSB_PER_UNIT */
+
+    /* ---- Bioimpedance (BIO_HAS_BIA) ----
+     * Single-frequency BIA (report at your phase-angle reference frequency,
+     * conventionally 50 kHz). R and Xc are the measured components; phase
+     * angle phi = atan(Xc / R) * 180/pi, carried directly so the main does no
+     * trig. Impedance magnitude |Z| = sqrt(R^2 + Xc^2) is recovered on the
+     * main from R and Xc (see bio_get_bia_impedance_ohm). For multi-frequency
+     * BIA, add a second {R,Xc,phase} triplet under a new present bit rather
+     * than overloading these. */
+    uint16_t bia_resistance_ohm; /* R,  BIO_BIA_LSB_PER_OHM, BIO_U16_NA if N/A */
+    uint16_t bia_reactance_ohm;  /* Xc, BIO_BIA_LSB_PER_OHM, BIO_U16_NA if N/A */
+    uint16_t bia_phase_deg;      /* phi, BIO_BIA_LSB_PER_DEG, BIO_U16_NA if N/A */
 } bio_telemetry_t;
 #pragma pack(pop)
 
@@ -119,6 +139,13 @@ static inline int16_t bio_clamp16(float v)
     if (v >  32767.0f) return  32767;
     if (v < -32768.0f) return -32768;
     return (int16_t)(v >= 0 ? v + 0.5f : v - 0.5f);
+}
+
+static inline uint16_t bio_clampu16(float v)
+{
+    if (v < 0.0f)       return 0;
+    if (v > 65535.0f)   return 65535;
+    return (uint16_t)(v + 0.5f);
 }
 
 /* Fill the IMU portion from engineering units. Pass the same low-g/high-g/gyro
@@ -147,6 +174,21 @@ static inline float bio_get_highg_g(const bio_telemetry_t *t, int axis)
 { return t->highg_g[axis] / BIO_HIGHG_LSB_PER_G; }
 static inline float bio_get_temp_c(const bio_telemetry_t *t)
 { return t->imu_temp / BIO_TEMP_LSB_PER_C; }
+
+/* ---- Bioimpedance decoders ---- */
+static inline float bio_get_bia_resistance_ohm(const bio_telemetry_t *t)
+{ return t->bia_resistance_ohm / BIO_BIA_LSB_PER_OHM; }
+static inline float bio_get_bia_reactance_ohm(const bio_telemetry_t *t)
+{ return t->bia_reactance_ohm / BIO_BIA_LSB_PER_OHM; }
+static inline float bio_get_bia_phase_deg(const bio_telemetry_t *t)
+{ return t->bia_phase_deg / BIO_BIA_LSB_PER_DEG; }
+/* Magnitude recovered from the two components -- no extra bytes on the wire. */
+static inline float bio_get_bia_impedance_ohm(const bio_telemetry_t *t)
+{
+    float r = bio_get_bia_resistance_ohm(t);
+    float x = bio_get_bia_reactance_ohm(t);
+    return sqrtf(r * r + x * x);
+}
 
 #ifdef __cplusplus
 }

@@ -32,8 +32,18 @@ static const char *TAG = "main";
 // 3-message DS-TWR: the PERIPHERAL sends the first message (Poll) and the
 // last (Final); the MAIN replies (Response) and computes the distance, so
 // the result lands on the MAIN node.
-#define MY_UWB_ROLE          UWB_ROLE_MAIN  // UWB_ROLE_PERIPHERAL or UWB_ROLE_MAIN
+#define MY_UWB_ROLE          UWB_ROLE_MAIN// UWB_ROLE_PERIPHERAL or UWB_ROLE_MAIN
 #define MY_PERIPHERAL_SUFFIX 'A'            // 'A'..'I', ignored for main
+
+// Which biosensors are physically wired on THIS board. Each enabled sensor
+// gets its own task that computes a DERIVED metric (not raw waveform) and
+// pushes it via uwb_bio_set_*(). Flash per-board with the right set enabled.
+#define BOARD_HAS_PPG   0
+#define BOARD_HAS_ECG   0
+#define BOARD_HAS_EMG   0
+#define BOARD_HAS_RESP  0
+#define BOARD_HAS_EEG   1
+#define BOARD_HAS_BIA   0
 
 // Main: which peripherals to range against, in cycle order. List only the
 // suffix character; the full address is "W<suffix>". The main round-robins
@@ -258,10 +268,13 @@ static void imu_timer_cb(void *arg)
     lsm6_sample_t s;
     if (lsm6_read_sample(&s) != ESP_OK) return;
 
-    // Publish to the UWB module so the peripheral can embed the freshest
-    // sample in its next Final frame. On the main this is harmless
-    // (the function checks role internally).
-    uwb_publish_local_imu(&s);
+    // Push the IMU slice into the shared telemetry struct. On the peripheral
+    // this is what the next Final frame carries; on the main it's unused by
+    // the protocol (harmless). Replaces uwb_publish_local_imu().
+    const float accel[3] = { s.ax_g,   s.ay_g,   s.az_g  };
+    const float gyro[3]  = { s.gx_dps, s.gy_dps, s.gz_dps };
+    const float highg[3] = { s.hx_g,   s.hy_g,   s.hz_g  };
+    uwb_bio_set_imu(accel, gyro, highg, s.temp_c);
 
     // Non-blocking send. If the queue is full, drop the oldest sample to
     // keep newest data flowing rather than backing up the timer.
@@ -417,7 +430,7 @@ static void imu_print_task(void *arg)
                 // Header. Reprint every cycle so the table is self-
                 // contained for log scraping. Column widths must match
                 // the format strings below or alignment breaks.
-                printf("# Node            d(m)     ax     ay     az    |h|       gz     T       ok   miss   age\n");
+                printf("# Node            d(m)     ax     ay     az    |h|       gz     T     HR   RR      Z   PhA     ok   miss   age\n");
 
                 // Row 0: main itself. No distance to self. IMU comes from
                 // window_peak_sample (the most recent windowed reading
@@ -426,8 +439,8 @@ static void imu_print_task(void *arg)
                 {
                     const lsm6_sample_t &q = window_peak_sample;
                     float h = sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g);
-                    printf("# Head  (main)    ---  %+6.2f %+6.2f %+6.2f  %5.2f  %+7.1f %5.1f      ---    ---   ---\n",
-                           q.ax_g, q.ay_g, q.az_g, h, q.gz_dps, q.temp_c);
+                    printf("# Head  (main)    ---  %+6.2f %+6.2f %+6.2f  %5.2f  %+7.1f %5.1f  ---  ---     ---   ---      ---    ---   ---\n",
+                            q.ax_g, q.ay_g, q.az_g, h, q.gz_dps, q.temp_c);
                 }
 
                 // Rows 1..15: peripherals A..O.
@@ -444,28 +457,49 @@ static void imu_print_task(void *arg)
                     printf("# W%c (%s)", suffix, kPosLabel[i]);
 
                     if (fresh) {
-                        const lsm6_sample_t &q = snap[i].result.peer_imu;
-                        bool imu_fresh = snap[i].result.peer_imu_valid;
-                        float h = imu_fresh
-                                ? sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g)
-                                : 0.0f;
-                        if (imu_fresh) {
+                        const bio_telemetry_t &b = snap[i].result.peer_bio;
+                        bool bio_ok = snap[i].result.peer_bio_valid;
+
+                        // IMU columns, gated on BIO_HAS_IMU, decoded via the accessors.
+                        if (bio_ok && (b.present_mask & BIO_HAS_IMU)) {
+                            float hx = bio_get_highg_g(&b, 0);
+                            float hy = bio_get_highg_g(&b, 1);
+                            float hz = bio_get_highg_g(&b, 2);
+                            float hmag = sqrtf(hx*hx + hy*hy + hz*hz);
                             printf(" %+6.2f  %+6.2f %+6.2f %+6.2f  %5.2f  %+7.1f %5.1f",
-                                   snap[i].result.distance_m,
-                                   q.ax_g, q.ay_g, q.az_g, h,
-                                   q.gz_dps, q.temp_c);
+                                snap[i].result.distance_m,
+                                bio_get_accel_g(&b, 0), bio_get_accel_g(&b, 1), bio_get_accel_g(&b, 2),
+                                hmag, bio_get_gyro_dps(&b, 2), bio_get_temp_c(&b));
                         } else {
-                            // Distance valid, IMU not yet (peripheral
-                            // hadn't published a sample at the moment
-                            // the Final was assembled).
                             printf(" %+6.2f     ---    ---    ---    ---      ---   ---",
-                                   snap[i].result.distance_m);
+                                snap[i].result.distance_m);
+                        }
+
+                        // Heart rate: prefer ECG, fall back to PPG.
+                        if (bio_ok && (b.present_mask & BIO_HAS_ECG) && b.ecg_hr_bpm != BIO_U8_NA)
+                            printf("  %3u", b.ecg_hr_bpm);
+                        else if (bio_ok && (b.present_mask & BIO_HAS_PPG) && b.ppg_hr_bpm != BIO_U8_NA)
+                            printf("  %3u", b.ppg_hr_bpm);
+                        else
+                            printf("  ---");
+
+                        // Respiration rate.
+                        if (bio_ok && (b.present_mask & BIO_HAS_RESP) && b.resp_rate_bpm != BIO_U8_NA)
+                            printf("  %3u", b.resp_rate_bpm);
+                        else
+                            printf("  ---");
+
+                        // Bioimpedance: magnitude + phase angle (gated on BIO_HAS_BIA).
+                        if (bio_ok && (b.present_mask & BIO_HAS_BIA) &&
+                            b.bia_resistance_ohm != BIO_U16_NA) {
+                            printf("  %5.0f  %4.1f",
+                                bio_get_bia_impedance_ohm(&b),
+                                bio_get_bia_phase_deg(&b));
+                        } else {
+                            printf("    ---   ---");
                         }
                     } else {
-                        // Nothing fresh: blank distance + IMU columns.
-                        // Counters and age still printed below to convey
-                        // link state independent of freshness.
-                        printf("    ---     ---    ---    ---    ---      ---   ---");
+                        printf("    ---     ---    ---    ---    ---      ---   ---  ---  ---     ---   ---");
                     }
 
                     // Counters + age. age "---" if never seen.
@@ -575,6 +609,54 @@ static void boot_reset_peripherals(void)
     lsm6_deinit();
 }
 
+#if BOARD_HAS_PPG
+static void ppg_task(void *arg) {
+    // PPG AFE samples ~50-100 Hz; run HR/SpO2 over a sliding window, publish ~4 Hz.
+    for (;;) {
+        // uint8_t hr = ppg_hr(); uint8_t spo2 = ppg_spo2(); uint8_t q = ppg_quality();
+        // uwb_bio_set_ppg(hr, spo2, q);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+#endif
+
+#if BOARD_HAS_ECG
+static void ecg_task(void *arg) {
+    // ECG ~250-500 Hz; detect R-peaks, compute HR + RMSSD on-node. Raw ECG
+    // does NOT go over UWB — only these derived values.
+    for (;;) {
+        // uint8_t hr = ecg_hr(); uint16_t rmssd = ecg_rmssd_ms(); uint8_t f = ecg_flags();
+        // uwb_bio_set_ecg(hr, rmssd, f);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+#endif
+
+#if BOARD_HAS_EMG
+static void emg_task(void *arg) {
+    // EMG ~1-2 kHz; compute windowed RMS per channel, publish the RMS vector.
+    for (;;) {
+        // float rms[BIO_EMG_CHANNELS] = { ... };
+        // uwb_bio_set_emg(rms);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+#endif
+
+#if BOARD_HAS_BIA
+static void bia_task(void *arg) {
+    // BIA AFE does a frequency sweep / fixed 50 kHz measurement. Compute R, Xc
+    // (and phase) on-node, publish a few times a second. Raw sweep stays local.
+    for (;;) {
+        // float R, Xc;  bia_measure(&R, &Xc);
+        // float phi = atan2f(Xc, R) * 57.29578f;   // degrees
+        // uwb_bio_set_bia(R, Xc, phi);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+#endif
+// RESP and EEG follow the identical pattern -> uwb_bio_set_resp / uwb_bio_set_eeg.
+
 // ---------------------------------------------------------------------------
 // app_main
 // ---------------------------------------------------------------------------
@@ -637,6 +719,18 @@ extern "C" void app_main(void)
     // --- Tasks ---
     xTaskCreate(imu_print_task, "imu_print", 4096, NULL, 5, NULL);
     xTaskCreate(uwb_task,       "uwb",       4096, NULL, 5, NULL);
+    #if BOARD_HAS_PPG
+        xTaskCreate(ppg_task, "ppg", 4096, NULL, 5, NULL);
+    #endif
+    #if BOARD_HAS_ECG
+        xTaskCreate(ecg_task, "ecg", 4096, NULL, 5, NULL);
+    #endif
+    #if BOARD_HAS_EMG
+        xTaskCreate(emg_task, "emg", 4096, NULL, 5, NULL);
+    #endif
+    #if BOARD_HAS_BIA
+        xTaskCreate(bia_task, "bia", 4096, NULL, 5, NULL);
+    #endif
 
     ESP_LOGI(TAG, "Tasks running. app_main exiting.");
 }

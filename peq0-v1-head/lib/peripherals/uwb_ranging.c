@@ -69,6 +69,7 @@
 #include <math.h>
 #include "bio_telemetry.h"
 #include "freertos/event_groups.h"
+#include "port.h"
 
 static const char *TAG = "uwb";
 
@@ -83,34 +84,14 @@ static EventGroupHandle_t s_uwb_evt = NULL;
 
 static volatile uint16_t s_cb_rx_len = 0;
 
-/* These run in the deca_irq task (task context, NOT ISR) — plain
- * xEventGroupSetBits is correct, no FromISR variant needed. */
-static void cb_txdone(const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_TXFRS); }
-static void cb_rxok (const dwt_cb_data_t *d){ s_cb_rx_len = d->datalength; xEventGroupSetBits(s_uwb_evt, EVT_RXFCG); }
-static void cb_rxto (const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_RXTO); }
-static void cb_rxerr(const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_RXERR); }
 
-static uint32_t wait_rx_event(int timeout_us)
-{
-    TickType_t to = pdMS_TO_TICKS((timeout_us / 1000) + 1);
-    EventBits_t b = xEventGroupWaitBits(s_uwb_evt, EVT_ANY_RX, pdTRUE, pdFALSE, to);
-    if (b & EVT_RXFCG) return SYS_STATUS_RXFCG_BIT_MASK;
-    if (b & EVT_RXTO)  return SYS_STATUS_ALL_RX_TO;
-    if (b & EVT_RXERR) return SYS_STATUS_ALL_RX_ERR;
-    return 0;   /* genuine software timeout: no IRQ at all */
-}
 
-static bool wait_txfrs(int timeout_us)
-{
-    TickType_t to = pdMS_TO_TICKS((timeout_us / 1000) + 1);
-    return (xEventGroupWaitBits(s_uwb_evt, EVT_TXFRS, pdTRUE, pdFALSE, to) & EVT_TXFRS) != 0;
-}
 
 
 
 /* was: + sizeof(lsm6_sample_t) */
-#define FINAL_BIO_IDX    25
-#define FINAL_FRAME_LEN  (25 + (int)sizeof(bio_telemetry_t))
+#define FINAL_BIO_IDX    25                                  /* was FINAL_IMU_IDX */
+#define FINAL_FRAME_LEN  (FINAL_BIO_IDX + (int)sizeof(bio_telemetry_t))   /* 25 + 56 = 81 */
 
 /* shared snapshot, generalizes your s_local_imu */
 static portMUX_TYPE     s_bio_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -207,7 +188,7 @@ void uwb_publish_telemetry(const bio_telemetry_t *t)
 #define SPEED_OF_LIGHT_M_PER_S      299702547.0
 
 /* DW3000 timestamp tick period: 1 / (499.2e6 * 128) ≈ 15.65 ps. */
-#define DWT_TIME_UNITS              (1.0 / 499200000.0 / 128.0)
+// #define DWT_TIME_UNITS              (1.0 / 499200000.0 / 128.0)
 
 float g_uwb_distance_offset_m = 0.0f;
 
@@ -235,7 +216,7 @@ float g_uwb_distance_offset_m = 0.0f;
 #define FN_RESPONSE     0x10
 #define FN_FINAL        0x29
 
-#define FCS_LEN         2
+// #define FCS_LEN         2
 
 /* Beacon: header only (10 bytes). The round counter is embedded for
  * debug/jitter analysis but isn't required by the protocol. */
@@ -255,7 +236,13 @@ float g_uwb_distance_offset_m = 0.0f;
 #define FINAL_RESP_RX_TS_IDX  15
 #define FINAL_FINAL_TX_TS_IDX 20
 #define FINAL_IMU_IDX         25
-#define FINAL_FRAME_LEN   (25 + (int)sizeof(lsm6_sample_t))
+
+/* These run in the deca_irq task (task context, NOT ISR) — plain
+ * xEventGroupSetBits is correct, no FromISR variant needed. */
+static void cb_txdone(const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_TXFRS); }
+static void cb_rxok (const dwt_cb_data_t *d){ s_cb_rx_len = d->datalength; xEventGroupSetBits(s_uwb_evt, EVT_RXFCG); }
+static void cb_rxto (const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_RXTO); }
+static void cb_rxerr(const dwt_cb_data_t *d){ (void)d; xEventGroupSetBits(s_uwb_evt, EVT_RXERR); }
 
 /* --------------------------------------------------------------------- */
 /* State                                                                  */
@@ -693,6 +680,7 @@ static bool main_handle_one_slot(uwb_range_result_t *out)
         if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
+        ESP_LOGW(TAG, "FINAL: no RXFCG (status=0x%08lX)", (unsigned long)status);
         dwt_forcetrxoff();
         return false;
     }
@@ -700,6 +688,7 @@ static bool main_handle_one_slot(uwb_range_result_t *out)
 
     /* === 5. Validate Final and extract timestamps + IMU. === */
     flen = dwt_getframelength(&ranging_bit);
+    ESP_LOGW(TAG, "FINAL: RXFCG flen=%u expect=%d", (unsigned)flen, FINAL_FRAME_LEN + FCS_LEN);
     if (flen != FINAL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
         dwt_forcetrxoff();
         return false;
@@ -759,7 +748,7 @@ static esp_err_t main_round_tdma(uwb_range_result_t *results)
     }
 
     /* Proactive recal between rounds (cheap, happens once per ~RECAL_INTERVAL). */
-    uwb_proactive_recal_if_due();
+    // uwb_proactive_recal_if_due();
 
     dwt_forcetrxoff();
     dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
@@ -853,6 +842,9 @@ static esp_err_t main_round_tdma(uwb_range_result_t *results)
     uwb_handle_cycle_result(ok_count > 0);
 
     s_round_counter++;
+    ESP_LOGI(TAG, "delays uus: pollRX->respTX=%d  respRX->finalTX=%d  finalRX_to=%d  respTX->finalRX(rxaftertx)=%d",
+         POLL_RX_TO_RESP_TX_DLY_UUS, RESP_RX_TO_FINAL_TX_DLY_UUS,
+         FINAL_RX_TIMEOUT_UUS, RESP_TX_TO_FINAL_RX_DLY_UUS);
 
     static int round_log = 0;
     if (round_log++ % 10 == 0) {
@@ -872,7 +864,7 @@ static esp_err_t peripheral_cycle_tdma(uwb_range_result_t *result)
     /* Optimistic: if any failure path runs, it'll overwrite this. */
     s_last_miss_reason = UWB_MISS_OTHER;
 
-    uwb_proactive_recal_if_due();
+    // uwb_proactive_recal_if_due();
 
     dwt_forcetrxoff();
     dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
@@ -1131,7 +1123,31 @@ static esp_err_t peripheral_cycle_tdma(uwb_range_result_t *result)
 
     dwt_writetxdata(FINAL_FRAME_LEN, final_frame, 0);
     dwt_writetxfctrl(FINAL_FRAME_LEN + FCS_LEN, 0, 1);
+    /* drop the Poll TX's stale TXFRS so the wait below blocks on the NEW one */
+    xEventGroupClearBits(s_uwb_evt, EVT_TXFRS);
+    /* polling build instead: dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK); */
+
     dwt_setdelayedtrxtime(final_tx_time);
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+        ESP_LOGW(TAG, "Final arm failed");
+        return false;
+    }
+
+    /* The Final fires ~6 ms out — block until it has actually transmitted,
+    * or the next round's rxenable will abort the pending delayed TX. */
+    if (!wait_txfrs(8000)) {
+        ESP_LOGW(TAG, "Final NOT transmitted (TXFRS timeout)");
+        return false;
+    }
+    /* only now is the Final truly on the air */
+    ESP_LOGI(TAG, "Peripheral cycle OK (Final sent)");
+    int fret = dwt_starttx(DWT_START_TX_DELAYED);     /* your flags */
+    uint32_t now = dwt_readsystimestamphi32();
+    ESP_LOGW(TAG, "FINAL TX: ret=%d sched_hi=0x%08lX now_hi=0x%08lX",
+            fret, (unsigned long)final_tx_time, (unsigned long)now);
+    ESP_LOGI(TAG, "delays uus: pollRX->respTX=%d  respRX->finalTX=%d  finalRX_to=%d  respTX->finalRX(rxaftertx)=%d",
+         POLL_RX_TO_RESP_TX_DLY_UUS, RESP_RX_TO_FINAL_TX_DLY_UUS,
+         FINAL_RX_TIMEOUT_UUS, RESP_TX_TO_FINAL_RX_DLY_UUS);
 
     /* DW3000 errata workaround (same as Poll TX): clear stale RX status
      * bits or dwt_starttx(DELAYED) may spuriously return DWT_ERROR. */
@@ -1191,6 +1207,8 @@ esp_err_t uwb_init(uwb_role_t role,
     const char max_suffix = 'A' + UWB_MAX_PERIPHERALS - 1;
     char suffix = peripheral_addr_suffix;
     if (suffix < 'A' || suffix > max_suffix) suffix = DEFAULT_PERIPH_SUFFIX;
+    ESP_LOGI(TAG, "FINAL_FRAME_LEN=%d  sizeof(bio_telemetry_t)=%u  version=%d",
+         FINAL_FRAME_LEN, (unsigned)sizeof(bio_telemetry_t), BIO_TELEM_VERSION);
 
     if (role == UWB_ROLE_MAIN) {
         s_my_addr_lo    = ADDR_MAIN_LO;       s_my_addr_hi    = ADDR_MAIN_HI;
@@ -1219,7 +1237,7 @@ esp_err_t uwb_init(uwb_role_t role,
         ESP_LOGE(TAG, "Wrong DEV_ID: 0x%08lX", (unsigned long)dev_id);
         return ESP_FAIL;
     }
-    dwt_setpllcaltemperature(TEMP_INIT);
+    // dwt_setpllcaltemperature(TEMP_INIT);
 
     if (dwt_configure((dwt_config_t *)&s_uwb_config) != DWT_SUCCESS) {
         ESP_LOGE(TAG, "dwt_configure failed");
@@ -1228,13 +1246,19 @@ esp_err_t uwb_init(uwb_role_t role,
     dwt_configuretxrf((dwt_txconfig_t *)&s_txconfig);
     dwt_settxantennadelay(TX_ANT_DLY);
     dwt_setrxantennadelay(RX_ANT_DLY);
-    dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
+    dwt_setlnapamode(DWT_LNA_ENABLE);
+    // dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
     ESP_LOGI(TAG, "UWB ready (chan 5, PLEN 64, 6.8 Mbps, TDMA DS-TWR)");
 
     if (!s_uwb_evt) s_uwb_evt = xEventGroupCreate();
 
-    dwt_setcallbacks(cb_txdone, cb_rxok, cb_rxto, cb_rxerr, NULL, NULL, NULL);
+    static dwt_callbacks_s s_dw_cbs = {0};
+    s_dw_cbs.cbTxDone = cb_txdone;
+    s_dw_cbs.cbRxOk   = cb_rxok;
+    s_dw_cbs.cbRxTo   = cb_rxto;
+    s_dw_cbs.cbRxErr  = cb_rxerr;
+    dwt_setcallbacks(&s_dw_cbs);
 
     /* Enable TX-done AND every RX terminator. If you enable only TX you'll see
     * the classic "tx callback fires, rx never does" hang on DWT_RESPONSE_EXPECTED. */
@@ -1274,11 +1298,98 @@ esp_err_t uwb_perform_round(uwb_range_result_t *results)
     }
 }
 
-void uwb_publish_local_imu(const lsm6_sample_t *sample)
+void uwb_bio_set_imu(const float accel_g[3], const float gyro_dps[3],
+                     const float highg_g[3], float temp_c)
 {
-    if (!sample) return;
-    portENTER_CRITICAL(&s_imu_lock);
-    s_local_imu       = *sample;
-    s_local_imu_valid = true;
-    portEXIT_CRITICAL(&s_imu_lock);
+    /* Pack OUTSIDE the lock — the critical section briefly masks the DW3000
+     * IRQ, so keep it to a few stores, not a dozen float multiplies. */
+    int16_t a[3], g[3], h[3];
+    for (int i = 0; i < 3; i++) {
+        a[i] = bio_clamp16(accel_g[i] * BIO_ACCEL_LSB_PER_G);
+        g[i] = bio_clamp16(gyro_dps[i] * BIO_GYRO_LSB_PER_DPS);
+        h[i] = bio_clamp16(highg_g[i] * BIO_HIGHG_LSB_PER_G);
+    }
+    int16_t tc = bio_clamp16(temp_c * BIO_TEMP_LSB_PER_C);
+
+    portENTER_CRITICAL(&s_bio_lock);
+    memcpy(s_local_bio.accel_g, a, sizeof(a));
+    memcpy(s_local_bio.gyro_dps, g, sizeof(g));
+    memcpy(s_local_bio.highg_g, h, sizeof(h));
+    s_local_bio.imu_temp = tc;
+    s_local_bio.present_mask |= BIO_HAS_IMU;
+    s_local_bio.version = BIO_TELEM_VERSION;
+    s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_ppg(uint8_t hr_bpm, uint8_t spo2_pct, uint8_t quality)
+{
+    portENTER_CRITICAL(&s_bio_lock);
+    s_local_bio.ppg_hr_bpm = hr_bpm; s_local_bio.ppg_spo2_pct = spo2_pct;
+    s_local_bio.ppg_quality = quality;
+    s_local_bio.present_mask |= BIO_HAS_PPG;
+    s_local_bio.version = BIO_TELEM_VERSION; s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_resp(uint8_t rate_bpm)
+{
+    portENTER_CRITICAL(&s_bio_lock);
+    s_local_bio.resp_rate_bpm = rate_bpm;
+    s_local_bio.present_mask |= BIO_HAS_RESP;
+    s_local_bio.version = BIO_TELEM_VERSION; s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_eeg(const float band_power[BIO_EEG_BANDS])
+{
+    uint16_t b[BIO_EEG_BANDS];
+    for (int i = 0; i < BIO_EEG_BANDS; i++) {
+        float v = band_power[i] * BIO_EEG_LSB_PER_UNIT;
+        if (v < 0) v = 0; else if (v > 65535.0f) v = 65535.0f;
+        b[i] = (uint16_t)(v + 0.5f);
+    }
+    portENTER_CRITICAL(&s_bio_lock);
+    memcpy(s_local_bio.eeg_band, b, sizeof(b));
+    s_local_bio.present_mask |= BIO_HAS_EEG;
+    s_local_bio.version = BIO_TELEM_VERSION; s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_ecg(uint8_t hr_bpm, uint16_t rmssd_ms, uint8_t flags)
+{
+    portENTER_CRITICAL(&s_bio_lock);
+    s_local_bio.ecg_hr_bpm = hr_bpm; s_local_bio.ecg_rmssd_ms = rmssd_ms;
+    s_local_bio.ecg_flags = flags;
+    s_local_bio.present_mask |= BIO_HAS_ECG;
+    s_local_bio.version = BIO_TELEM_VERSION; s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_emg(const float rms[BIO_EMG_CHANNELS])
+{
+    int16_t r[BIO_EMG_CHANNELS];
+    for (int i = 0; i < BIO_EMG_CHANNELS; i++)
+        r[i] = bio_clamp16(rms[i] * BIO_EMG_LSB_PER_UNIT);
+    portENTER_CRITICAL(&s_bio_lock);
+    memcpy(s_local_bio.emg_rms, r, sizeof(r));
+    s_local_bio.present_mask |= BIO_HAS_EMG;
+    s_local_bio.version = BIO_TELEM_VERSION; s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
+}
+
+void uwb_bio_set_bia(float resistance_ohm, float reactance_ohm, float phase_angle_deg)
+{
+    uint16_t r = bio_clampu16(resistance_ohm * BIO_BIA_LSB_PER_OHM);
+    uint16_t x = bio_clampu16(reactance_ohm  * BIO_BIA_LSB_PER_OHM);
+    uint16_t p = bio_clampu16(phase_angle_deg * BIO_BIA_LSB_PER_DEG);
+
+    portENTER_CRITICAL(&s_bio_lock);
+    s_local_bio.bia_resistance_ohm = r;
+    s_local_bio.bia_reactance_ohm  = x;
+    s_local_bio.bia_phase_deg      = p;
+    s_local_bio.present_mask |= BIO_HAS_BIA;
+    s_local_bio.version = BIO_TELEM_VERSION;
+    s_local_bio_valid = true;
+    portEXIT_CRITICAL(&s_bio_lock);
 }
