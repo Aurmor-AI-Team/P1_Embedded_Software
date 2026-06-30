@@ -1,5 +1,15 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# PlatformIO
+.pio/
+**/.pio/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Raspberry Pi image (from receiver)
 /peq0-v1-receiver/Raspberry Pi Image
-peq0-v1-receiver/.DS_Store
-rpi-receiver/.DS_Store
-.DS_Store
-.DS_Store
