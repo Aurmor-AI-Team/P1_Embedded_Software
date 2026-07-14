@@ -1,0 +1,19 @@
+{
+  "name": "dw3000",
+  "version": "0.1.0",
+  "build": {
+    "srcFilter": [
+      "+<dwt_uwb_driver/**/*.c>",
+      "-<dwt_uwb_driver/utest/**>",
+      "+<port/**/*.c>"
+    ],
+    "includeDir": ".",
+    "flags": [
+      "-I lib/dw3000/dwt_uwb_driver",
+      "-I lib/dw3000/dwt_uwb_driver/dw3000",
+      "-I lib/dw3000/dwt_uwb_driver/dw3720",
+      "-I lib/dw3000/dwt_uwb_driver/lib/qmath/include",
+      "-Wno-error=maybe-uninitialized"
+    ]
+  }
+}

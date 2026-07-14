@@ -18,11 +18,32 @@ from typing import Dict, Iterator, List, Tuple
 SERVICE_UUID = "5a8e0000-9b1a-4c7d-8e2f-1f3a5b7c9d10"
 META_UUID = "5a8e0001-9b1a-4c7d-8e2f-1f3a5b7c9d10"      # read   -> JSON descriptor
 DATA_UUID = "5a8e0002-9b1a-4c7d-8e2f-1f3a5b7c9d10"      # notify -> binary-v1 byte stream
-CONTROL_UUID = "5a8e0003-9b1a-4c7d-8e2f-1f3a5b7c9d10"   # write  -> start/stop/restart
+CONTROL_UUID = "5a8e0003-9b1a-4c7d-8e2f-1f3a5b7c9d10"   # write  -> start/stop/restart/forget [wid]
+WIFI_CREDS_UUID = "5a8e0004-9b1a-4c7d-8e2f-1f3a5b7c9d10"  # read -> JSON {ssid,password,ip,port,pi_id}
+WEARABLES_UUID = "5a8e0005-9b1a-4c7d-8e2f-1f3a5b7c9d10"   # read -> JSON {"active":[{"wid","node"}]}
 
 DEFAULT_DEVICE_NAME = "aurmor-rpi"
 DEFAULT_CHUNK_SIZE = 180         # safe after MTU negotiation (notification <= MTU-3)
 SCHEMA_VERSION = 2               # 2 = binary-v1 framing (was 1 = NDJSON)
+
+# The receiver broadcasts which wearables are live (heard over its WiFi in the
+# last few seconds) as manufacturer-specific data in its BLE advertisement, so
+# the app's passive scan can show a BLE-silent provisioned ESP32 as detected
+# WITHOUT connecting (a connection each poll is what prompted the iOS pairing
+# dialog). Mirrored in aurmor-sports-mobile/features/esp32-provisioning/protocol.ts.
+# 0xFFFF is the Bluetooth-SIG "internal/test" company id. Payload after the
+# company id: [version=1, wid-bitmask] (bit i set => wid i+1 is live).
+PRESENCE_MFG_ID = 0xFFFF
+PRESENCE_VERSION = 1
+
+
+def presence_manufacturer_data(active_wids) -> list:
+    """Payload bytes ([version, bitmask]) for the presence advertisement."""
+    bitmask = 0
+    for wid in active_wids:
+        if 1 <= wid <= 8:
+            bitmask |= 1 << (wid - 1)
+    return [PRESENCE_VERSION, bitmask & 0xFF]
 
 # Constant / redundant columns dropped from each sample to save BLE bytes.
 _DROP_COLUMNS = {"timestamp_iso", "label", "version", "present_mask_hex"}
@@ -179,6 +200,48 @@ def encode_pose_binary(t_s: float, tran, quats) -> bytes:
         for c in q:
             parts.append(_pack_value("i16", POSE_QUAT_SCALE, c))
     return b"".join(parts)
+
+
+# Fields carried by the ESP32's UDP packet, in wire order (see udp_source.py /
+# wifi_udp_tx.cpp). The 10 IMU fields (curated in FIELD_SPECS above) plus 4 mock
+# biometric fields the app renders as Heart rate / SpO2 / Respiration / HRV. A
+# real head sensor has no biometrics; the mock playback fills these from the
+# chest (ECG) and wrist (PPG) reference data so the session screen shows them.
+LIVE_IMU_FIELDS: List[str] = [
+    "ax_g", "ay_g", "az_g",
+    "gx_dps", "gy_dps", "gz_dps",
+    "hx_g", "hy_g", "hz_g",
+    "imu_temp_c",
+]
+LIVE_BIO_FIELDS: List[str] = [
+    "ecg_hr_bpm",     # Heart rate (bpm)
+    "ppg_spo2_pct",   # SpO2 (%)
+    "resp_rate_bpm",  # Respiration (breaths/min)
+    "ecg_rmssd_ms",   # HRV RMSSD (ms)
+]
+# Compact (type, scale) for the bio fields (kept out of the shared FIELD_SPECS
+# so the CSV-replay encoding is untouched).
+_LIVE_BIO_SPECS: Dict[str, Tuple[str, int]] = {
+    "ecg_hr_bpm": ("u16", 1),
+    "ppg_spo2_pct": ("u16", 100),
+    "resp_rate_bpm": ("u16", 1),
+    "ecg_rmssd_ms": ("u16", 1),
+}
+
+
+def build_live_protocol_meta(nodes: List[str]):
+    """Decode tables for the live UDP source: every node shares one IMU+bio
+    layout.
+
+    Same return shape as build_protocol_meta (field_specs, layouts, node_layout)
+    so encode_sample_binary and the app's decoder work unchanged.
+    """
+    field_specs: Dict[str, List] = {f: list(FIELD_SPECS[f]) for f in LIVE_IMU_FIELDS}
+    for f in LIVE_BIO_FIELDS:
+        field_specs[f] = list(_LIVE_BIO_SPECS[f])
+    layouts = [LIVE_IMU_FIELDS + LIVE_BIO_FIELDS]
+    node_layout = [0] * len(nodes)
+    return field_specs, layouts, node_layout
 
 
 def build_protocol_meta(frames, nodes: List[str]):

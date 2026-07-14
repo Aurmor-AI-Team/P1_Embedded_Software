@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Replay mock biometric CSVs over BLE (GATT notifications) to the mobile app.
+"""Stream biometric data over BLE (GATT notifications) to the mobile app.
 
 The Raspberry Pi acts as a BLE *peripheral*: it advertises ``aurmor-rpi``,
-exposes one service with a Meta (read) and a Data (notify) characteristic, and
-streams the recorded session "with respect to time" as binary-v1 records (see
-protocol.py), one sample per node per 255 ms tick. The React Native app
-(react-native-ble-plx, a BLE *central*) scans by name, connects, reads Meta for
-the decode tables, and subscribes to the Data characteristic.
+exposes one service with Meta (read), Data (notify), Control (write) and
+WifiCreds (read) characteristics, and streams binary-v1 records (see
+protocol.py). The React Native app (react-native-ble-plx, a BLE *central*)
+scans by name, connects, reads Meta for the decode tables, and subscribes to
+the Data characteristic.
+
+Two sources:
+  --source udp (default)  live IMU samples from ESP32 wearables on the Pi's
+                          hidden WiFi AP (see wifi_ap.py / udp_source.py)
+  --source csv            the original mock-CSV replay
 
   Run on the Pi:        python3 ble_sender.py
-  Dry-run on any host:  python3 ble_sender.py --stdout --speed 20
+  Dry-run on any host:  python3 ble_sender.py --source csv --stdout --speed 20
+                        python3 ble_sender.py --source udp --stdout --no-ap
 
 See README.md for the GATT layout, UUIDs, and Raspberry Pi setup.
 """
@@ -25,6 +31,8 @@ from pathlib import Path
 import pose as pose_mod
 import protocol
 import replay
+import wifi_ap
+from udp_source import UdpImuSource
 
 
 def resolve_data_dir(args) -> Path:
@@ -43,8 +51,8 @@ def resolve_pose_file(args, exercise: str) -> Path:
 
 
 def build_meta(exercise: str, frames, nodes, chunk_size: int,
-               field_specs, layouts, node_layout) -> bytes:
-    per = replay.period_ms(frames)
+               field_specs, layouts, node_layout, period_ms=None) -> bytes:
+    per = replay.period_ms(frames) if period_ms is None else period_ms
     descriptor = {
         "exercise": exercise,
         "period_ms": per,
@@ -96,7 +104,8 @@ class BleSender:
     def __init__(self, frames, meta_bytes, name, adapter_addr,
                  chunk_size, speed, loop, verbose,
                  nodes, field_specs, layouts, node_layout,
-                 button_pin=None, power_button=False, pose_seq=None):
+                 button_pin=None, power_button=False, pose_seq=None,
+                 source=None, live_period_ms=100, wifi_creds_bytes=b"{}"):
         self.frames = frames
         self.pose_seq = pose_seq
         self.meta_bytes = meta_bytes
@@ -108,12 +117,21 @@ class BleSender:
         self.name = name
         self.adapter_addr = adapter_addr
         self.chunk_size = chunk_size
-        self.frame_interval_ms = max(1, round(replay.period_ms(frames) / speed))
+        self.source = source  # UdpImuSource when live; None = CSV replay
+        self.wifi_creds_bytes = wifi_creds_bytes
+        if source is not None:
+            self.frame_interval_ms = max(1, int(live_period_ms))
+        else:
+            self.frame_interval_ms = max(1, round(replay.period_ms(frames) / speed))
         self.loop = loop
         self.verbose = verbose
         self.button_pin = button_pin
         self.power_button = power_button
         self.use_button = (button_pin is not None) or power_button
+        self._last_wait_log = 0.0
+        self._wearables_cache = b'{"active":[]}'
+        self._periph = None
+        self._last_presence = None
 
         self.data_char = None
         self.frame_idx = 0
@@ -134,12 +152,40 @@ class BleSender:
         offset = int(options.get("offset", 0))
         return list(self.meta_bytes[offset:])
 
+    def wifi_creds_read(self, options):
+        # Same read-blob offset handling as meta_read (payload is small, but a
+        # low negotiated MTU still splits the read).
+        offset = int(options.get("offset", 0))
+        return list(self.wifi_creds_bytes[offset:])
+
+    def wearables_read(self, options):
+        # Live presence for BLE-silent wearables: which boards the UDP source
+        # heard from recently. Rendered once per read (offset 0) so blob
+        # continuations can't tear across a state change.
+        offset = int(options.get("offset", 0))
+        if offset == 0:
+            active = self.source.active_wearables() if self.source else {}
+            self._wearables_cache = json.dumps(
+                {"active": [{"wid": wid, "node": node}
+                            for wid, node in sorted(active.items())]},
+                separators=(",", ":")).encode("utf-8")
+        return list(self._wearables_cache[offset:])
+
     def control_write(self, value, options):
         cmd = bytes(value).decode("utf-8", "ignore").strip().lower()
+        parts = cmd.split()
         if cmd in ("start", "restart"):
             self.start()
         elif cmd == "stop":
             self.stop()
+        elif parts and parts[0] == "forget":
+            wid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+            if self.source is not None:
+                # Retries sleep between sends — keep them off the GLib/BLE loop.
+                threading.Thread(target=self.source.send_forget, args=(wid,),
+                                 daemon=True).start()
+            else:
+                print("# control: 'forget' ignored (csv source)", file=sys.stderr)
         if self.verbose:
             print(f"# control: {cmd!r}", file=sys.stderr)
 
@@ -179,6 +225,8 @@ class BleSender:
     def start(self):
         self.frame_idx = 0
         self.running = True
+        if self.source is not None:
+            self.source.drain()  # discard backlog accumulated while unsubscribed
         # Always (re)send Meta first so a fresh subscriber — or a restart/loop —
         # can decode the samples that follow.
         self._send_meta()
@@ -186,9 +234,10 @@ class BleSender:
             self.timer_active = True
             # bluezero renamed add_timeout() -> add_timer_ms(); support both.
             add_timer = getattr(self._async, 'add_timer_ms', None) or self._async.add_timeout
-            add_timer(self.frame_interval_ms, self._emit_frame)
+            emit = self._emit_live if self.source is not None else self._emit_frame
+            add_timer(self.frame_interval_ms, emit)
         if self.verbose:
-            print("# replay started", file=sys.stderr)
+            print("# streaming started", file=sys.stderr)
 
     def stop(self):
         self.running = False  # _emit_frame tears the timer down on its next tick
@@ -225,6 +274,33 @@ class BleSender:
         if self.verbose:
             print(f"# sent t_s={frame.t_s:.3f} ({len(frame.samples)} nodes)",
                   file=sys.stderr)
+        return True
+
+    def _emit_live(self):
+        """Timer tick in live mode: drain the UDP queue and notify each sample."""
+        if not self.running or self.data_char is None:
+            self.timer_active = False
+            return False
+        samples = self.source.drain()
+        if not samples:
+            now = time.monotonic()
+            if now - self._last_wait_log >= 5.0:
+                print("# waiting for UDP data from wearables…", file=sys.stderr)
+                self._last_wait_log = now
+            return True
+        for sample in samples:
+            node_idx = self.node_index.get(sample["node"])
+            if node_idx is None:
+                continue
+            layout = self.layouts[self.node_layout[node_idx]]
+            payload = protocol.encode_sample_binary(
+                sample, node_idx, layout, self.field_specs)
+            message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
+            for chunk in protocol.chunk_bytes(message, self.chunk_size):
+                self.data_char.set_value(list(chunk))
+        if self.verbose:
+            print(f"# sent {len(samples)} live samples "
+                  f"(t_s={samples[-1]['t_s']:.3f})", file=sys.stderr)
         return True
 
     # -- bring-up ----------------------------------------------------------- #
@@ -333,27 +409,104 @@ class BleSender:
             value=[], notifying=False,
             flags=["write", "write-without-response"],
             write_callback=self.control_write)
+        periph.add_characteristic(
+            srv_id=1, chr_id=4, uuid=protocol.WIFI_CREDS_UUID,
+            value=list(self.wifi_creds_bytes), notifying=False,
+            flags=["read"], read_callback=self.wifi_creds_read)
+        periph.add_characteristic(
+            srv_id=1, chr_id=5, uuid=protocol.WEARABLES_UUID,
+            value=list(self._wearables_cache), notifying=False,
+            flags=["read"], read_callback=self.wearables_read)
 
         if self.button_pin is not None:
             self._arm_gpio_button()
         if self.power_button:
             self._arm_power_button()
 
+        # Broadcast live-wearable presence in the advertisement (live mode only)
+        # so the app shows a BLE-silent ESP32 as detected without connecting.
+        self._periph = periph
+        if self.source is not None:
+            self._arm_presence_adv()
+
         trigger = (f"press {self._trigger_desc()}" if self.use_button
                    else "subscribe from the app")
-        print(f"Advertising '{self.name}' on {addr} — {len(self.frames)} frames "
-              f"@ {self.frame_interval_ms} ms/frame, chunk={self.chunk_size}B. "
+        src_desc = ("live UDP samples" if self.source is not None
+                    else f"{len(self.frames)} frames")
+        print(f"Advertising '{self.name}' on {addr} — {src_desc} "
+              f"@ {self.frame_interval_ms} ms/tick, chunk={self.chunk_size}B. "
               f"Streaming starts when you {trigger}. Ctrl-C to stop.")
         try:
             periph.publish()
         except KeyboardInterrupt:
             print("\nStopped.")
 
+    # -- presence advertisement --------------------------------------------- #
+    def _presence_data(self):
+        active = self.source.active_wearables() if self.source else {}
+        return protocol.presence_manufacturer_data(active.keys())
+
+    @staticmethod
+    def _set_mfg_data(advert, mid, data):
+        """Set manufacturer data across bluezero API variants (method name and
+        signature differ between versions)."""
+        fn = getattr(advert, "manufacturer_data", None) or \
+            getattr(advert, "add_manufacturer_data", None)
+        if fn is None:
+            raise AttributeError("advertisement has no manufacturer_data setter")
+        fn(mid, data)
+
+    def _arm_presence_adv(self):
+        """Set the initial presence manufacturer data and refresh it on a timer.
+        Best-effort: bluezero advertisement details vary, so any failure is
+        logged and simply disables the passive-presence broadcast."""
+        try:
+            self._set_mfg_data(self._periph.advert, protocol.PRESENCE_MFG_ID,
+                               self._presence_data())
+        except Exception as exc:  # noqa: BLE001 - never block streaming
+            print(f"# presence-adv: could not set manufacturer data ({exc}); "
+                  f"passive ESP32 presence disabled", file=sys.stderr)
+            return
+        self._last_presence = self._presence_data()
+        add_timer = getattr(self._async, 'add_timer_ms', None) or self._async.add_timeout
+        add_timer(4000, self._refresh_presence_adv)
+        print("# presence-adv: broadcasting live-wearable presence", file=sys.stderr)
+
+    def _refresh_presence_adv(self):
+        data = self._presence_data()
+        if data != self._last_presence:
+            try:
+                # Re-register the advertisement so BlueZ picks up the new payload.
+                self._periph.ad_manager.unregister_advertisement(self._periph.advert)
+                self._set_mfg_data(self._periph.advert, protocol.PRESENCE_MFG_ID, data)
+                self._periph.ad_manager.register_advertisement(self._periph.advert, {})
+                self._last_presence = data
+            except Exception as exc:  # noqa: BLE001
+                print(f"# presence-adv: refresh failed ({exc})", file=sys.stderr)
+                return False  # stop the timer; stale presence is better than churn
+        return True
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", choices=("udp", "csv"), default="udp",
+                   help="data source: live UDP from ESP32 wearables (default) "
+                        "or the mock-CSV replay")
+    p.add_argument("--config", default=None,
+                   help="receiver config JSON (default: receiver_config.json "
+                        "next to this script; created with generated secrets "
+                        "on first run)")
+    p.add_argument("--udp-port", type=int, default=None,
+                   help="UDP listen port in live mode (default: from config)")
+    p.add_argument("--pi-id", type=int, default=None,
+                   help="this Pi's ID for WELCOME/FORGET (default: from config)")
+    p.add_argument("--no-ap", action="store_true",
+                   help="don't bring up the hidden WiFi AP (live mode)")
+    p.add_argument("--live-period-ms", type=int, default=100,
+                   help="UDP queue drain interval in live mode "
+                        "(default: %(default)s ms)")
     p.add_argument("--exercise", default="10_pushups_biometric_data_simulation",
                    help="folder under mock-csv/ to replay (default: %(default)s)")
     p.add_argument("--data-dir", default=None,
@@ -389,10 +542,57 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def run_stdout_live(source, period_ms: int) -> None:
+    """Dry-run for live mode: drain the UDP queue to stdout as NDJSON."""
+    try:
+        while True:
+            for sample in source.drain():
+                sys.stdout.buffer.write(protocol.sample_to_ndjson(sample))
+            sys.stdout.buffer.flush()
+            time.sleep(period_ms / 1000.0)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+def main_udp(args) -> None:
+    cfg_path = Path(args.config).expanduser() if args.config else wifi_ap.DEFAULT_CONFIG_PATH
+    cfg = wifi_ap.load_config(cfg_path)
+    if args.udp_port is not None:
+        cfg["udp_port"] = args.udp_port
+    if args.pi_id is not None:
+        cfg["pi_id"] = args.pi_id
+    if not args.no_ap:
+        wifi_ap.ensure_ap(cfg)
+
+    source = UdpImuSource(cfg["udp_port"], cfg["pi_id"], verbose=args.verbose)
+    source.start()
+
+    if args.stdout:
+        run_stdout_live(source, args.live_period_ms)
+        return
+
+    nodes = source.nodes
+    field_specs, layouts, node_layout = protocol.build_live_protocol_meta(nodes)
+    meta = build_meta("live-udp", [], nodes, args.chunk_size,
+                      field_specs, layouts, node_layout,
+                      period_ms=args.live_period_ms)
+
+    BleSender([], meta, args.name, args.adapter,
+              args.chunk_size, args.speed, args.loop, args.verbose,
+              nodes, field_specs, layouts, node_layout,
+              button_pin=args.button_pin, power_button=args.power_button,
+              source=source, live_period_ms=args.live_period_ms,
+              wifi_creds_bytes=wifi_ap.wifi_creds_json(cfg)).run()
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.speed <= 0:
         raise SystemExit("--speed must be > 0")
+
+    if args.source == "udp":
+        main_udp(args)
+        return
 
     data_dir = resolve_data_dir(args)
     frames, nodes = replay.load_frames(data_dir)
@@ -417,11 +617,17 @@ def main(argv=None):
         run_stdout(frames, args.speed, args.loop, args.verbose, pose_seq=pose_seq)
         return
 
+    # Serve WiFi creds in csv mode too when a receiver config already exists
+    # (lets provisioning be tested against the replay source).
+    cfg_path = Path(args.config).expanduser() if args.config else wifi_ap.DEFAULT_CONFIG_PATH
+    creds = wifi_ap.wifi_creds_json(wifi_ap.load_config(cfg_path)) \
+        if cfg_path.exists() else b"{}"
+
     BleSender(frames, meta, args.name, args.adapter,
               args.chunk_size, args.speed, args.loop, args.verbose,
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,
-              pose_seq=pose_seq).run()
+              pose_seq=pose_seq, wifi_creds_bytes=creds).run()
 
 
 if __name__ == "__main__":

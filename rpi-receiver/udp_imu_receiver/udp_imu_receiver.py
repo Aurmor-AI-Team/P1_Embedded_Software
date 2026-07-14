@@ -15,8 +15,8 @@ Message framing — all messages start with a 4-byte header:
     uint8  version
     uint16 wearable_id
 
-IMU     (52 bytes) = header + uint32 seq, uint32 t_ms, 10 floats
-                     (ax,ay,az, gx,gy,gz, hx,hy,hz, temp_c)
+IMU     (68 bytes) = header + uint32 seq, uint32 t_ms, 14 floats
+                     (ax,ay,az, gx,gy,gz, hx,hy,hz, temp_c, hr,spo2,resp,hrv)
 HELLO   (8 bytes, wearable->Pi)  = header + uint32 nonce
 WELCOME (12 bytes, Pi->wearable) = header + uint32 nonce + uint32 pi_id
 """
@@ -29,7 +29,7 @@ MSG_IMU, MSG_HELLO, MSG_WELCOME = 1, 2, 3
 VERSION = 1
 
 HDR      = struct.Struct("<BBH")        # msg_type, version, wearable_id  (4)
-IMU_BODY = struct.Struct("<II10f")      # seq, t_ms, 10 floats            (48)
+IMU_BODY = struct.Struct("<II14f")      # seq, t_ms, 10 IMU + 4 bio floats (64)
 HELLO    = struct.Struct("<BBHI")       # header + nonce                  (8)
 WELCOME  = struct.Struct("<BBHII")      # header + nonce + pi_id          (12)
 
@@ -69,7 +69,8 @@ def main():
 
         if msg_type == MSG_IMU and len(data) == IMU_SIZE:
             (seq, t_ms,
-             ax, ay, az, gx, gy, gz, hx, hy, hz, temp_c) = IMU_BODY.unpack_from(data, HDR.size)
+             ax, ay, az, gx, gy, gz, hx, hy, hz, temp_c,
+             _hr, _spo2, _resp, _hrv) = IMU_BODY.unpack_from(data, HDR.size)
 
             st = stats.setdefault(wid, {"last_seq": None, "dropped": 0, "received": 0})
             if st["last_seq"] is not None:

@@ -1,8 +1,12 @@
 # ble-sender
 
-Replays the recorded **mock biometric session** over **Bluetooth Low Energy** so
-the mobile app has a realistic live stream to develop against. This is the
-**sender only** — the React Native receiver comes later.
+Streams biometric data over **Bluetooth Low Energy** to the mobile app, from one
+of two sources:
+
+- **`--source udp` (default)** — live IMU samples from ESP32-C6 wearables that
+  joined the Pi's hidden WiFi access point (see *Live mode* below);
+- **`--source csv`** — replays the recorded **mock biometric session** so the
+  app has a realistic stream to develop against without hardware.
 
 ## Why a BLE *peripheral*
 
@@ -36,10 +40,16 @@ Advertised name: **`aurmor-rpi`** (override with `--name`).
 | Service | `5a8e0000-9b1a-4c7d-8e2f-1f3a5b7c9d10` | — | primary service |
 | **Meta** | `5a8e0001-…` | read | JSON descriptor: `{…,"chunk_size","framing":"binary-v1","schema",` `"field_specs","layouts","node_layout"}` — carries the binary-v1 decode tables |
 | **Data** | `5a8e0002-…` | notify | binary-v1 byte stream (see framing) |
-| **Control** | `5a8e0003-…` | write | ASCII `start` / `stop` / `restart` (optional; replay auto-starts on Data subscribe) |
+| **Control** | `5a8e0003-…` | write | ASCII `start` / `stop` / `restart` / `forget [wid]` (streaming auto-starts on Data subscribe; `forget` sends a UDP FORGET to a wearable — live mode only) |
+| **WifiCreds** | `5a8e0004-…` | read | JSON `{"ssid","password","ip","port","pi_id"}` — the hidden AP credentials the app forwards to an ESP32 during pairing (`{}` when no config exists) |
 
 The UUIDs and framing live in [protocol.py](protocol.py) — the single source of
 truth the RN receiver must mirror.
+
+> **Phone GATT cache.** The WifiCreds characteristic was added later; a phone
+> that talked to the Pi before may serve a stale GATT table and fail the creds
+> read. Toggle Bluetooth off/on (or forget the peripheral in system settings)
+> to refresh it.
 
 ## Wire framing (binary-v1 + MTU chunking)
 
@@ -74,6 +84,71 @@ size need **not** align with record boundaries.
 > request up to 517 via `requestMTUForDevice`), raise it, e.g. `--chunk-size 180`.
 > Keep it **≤ negotiated MTU − 3**; BlueZ silently truncates a larger notification.
 
+## Live mode (default): ESP32 wearables over WiFi/UDP
+
+```
+ ESP32-C6 wearable                Raspberry Pi (this script)             Phone
+ ┌─────────────────┐   UDP :5005  ┌─────────────────────────────┐  BLE   ┌─────────┐
+ │ joins hidden AP │ ───────────► │ udp_source.py → queue        │ ─────► │ app     │
+ │ 52 B IMU pkts   │ ◄─────────── │ ble_sender.py  (binary-v1)   │ notify │         │
+ └─────────────────┘ WELCOME/     │ wifi_ap.py     (nmcli AP)    │        └─────────┘
+                     FORGET       └─────────────────────────────┘
+```
+
+- **Hidden AP** — on startup the script ensures a hidden WiFi access point via
+  **NetworkManager/nmcli** (connection `aurmor-ap`, `ipv4.method shared`, Pi IP
+  `10.42.0.1`). Skip with `--no-ap`. Note: shared mode claims `wlan0`, so use
+  Ethernet for SSH while developing.
+- **Privileges** — *creating* the AP profile needs NetworkManager rights, which
+  plain users don't have over SSH (polkit treats SSH sessions as inactive).
+  Either run the script once with `sudo` (the profile persists and autoconnects
+  from then on; later unprivileged runs are read-only when it's already up), or
+  grant them permanently:
+
+  ```bash
+  sudo usermod -aG netdev $USER    # then log out/in
+  sudo tee /etc/polkit-1/rules.d/50-networkmanager-netdev.rules > /dev/null <<'EOF'
+  polkit.addRule(function(action, subject) {
+      if (action.id.indexOf("org.freedesktop.NetworkManager.") == 0 &&
+          subject.isInGroup("netdev")) {
+          return polkit.Result.YES;
+      }
+  });
+  EOF
+  sudo systemctl restart polkit
+  ```
+- **`receiver_config.json`** — created next to the script on first run with a
+  generated AP password and `pi_id`; served to the app via **WifiCreds**. It
+  holds a secret — it is git-ignored, don't commit it.
+- **Wearable IDs** — every UDP packet carries a `wearable_id`; `udp_source.py`
+  maps them to body nodes (`WID_TO_NODE = {1:HEAD, 2:WA, 3:WD, 4:WE}`, one per
+  body position the app assigns at pairing). Packets from unmapped IDs are
+  answered (HELLO→WELCOME) but not streamed.
+- **Ghost stations** — after an ESP32 loses power ungracefully, the AP keeps a
+  stale association for its MAC and rejects the board's re-auth on reboot
+  (disconnect reason 2) until it's removed. Install the eviction service so a
+  rebooting board rejoins in seconds instead:
+
+  ```bash
+  sudo install -m 755 tools/evict_stale_stations.py /usr/local/bin/
+  sudo cp tools/aurmor-wifi-evict.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now aurmor-wifi-evict.service
+  ```
+
+  It evicts any station passing **no data packets** for a window (~10 s). Note:
+  idle-*time* eviction does NOT work — a stuck board retries auth every ~2.5 s,
+  which resets the AP's inactivity timer; only real data (a live board HELLOs
+  every 2 s) distinguishes it. (One-off manual clear: `sudo iw dev wlan0 station
+  del <mac>`.)
+- **Unpair** — the app writes `forget <wid>` to Control; the Pi sends a UDP
+  FORGET (msg_type 4) to that wearable's last-seen address, and the board wipes
+  its credentials and leaves the network.
+- **Dev without hardware** — terminal A:
+  `python3 ble_sender.py --source udp --stdout --no-ap`, terminal B:
+  `python3 tools/fake_esp32_sender.py` (sends the HEAD mock CSV as real packets).
+- The standalone debug receiver `../udp_imu_receiver/udp_imu_receiver.py` is
+  unchanged; don't run it at the same time as live mode (both bind :5005).
+
 ## Run
 
 ### Raspberry Pi (real BLE)
@@ -84,8 +159,8 @@ sudo apt update
 sudo apt install -y python3-dbus python3-gi libdbus-1-dev libgirepository1.0-dev bluez
 
 pip install -r requirements.txt
-python3 ble_sender.py                 # advertises "aurmor-rpi", waits for a subscriber
-python3 ble_sender.py --loop --verbose --chunk-size 180
+python3 ble_sender.py                 # live mode: hidden AP + UDP→BLE bridge
+python3 ble_sender.py --source csv --loop --verbose --chunk-size 180   # mock replay
 ```
 
 Requires **BlueZ ≥ 5.43**. If advertising/GATT registration fails on your image,

@@ -13,3 +13,6 @@ __pycache__/
 
 # Raspberry Pi image (from receiver)
 /peq0-v1-receiver/Raspberry Pi Image
+
+# Per-Pi receiver config (generated on first run; holds the AP password)
+rpi-receiver/ble-sender/receiver_config.json
