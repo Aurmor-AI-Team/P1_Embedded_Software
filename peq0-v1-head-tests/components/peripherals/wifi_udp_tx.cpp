@@ -1,27 +1,18 @@
 // ---------------------------------------------------------------------------
-// wifi_udp_tx.cpp — Wi-Fi station + UDP transmit/handshake path for IMU data.
+// wifi_udp_tx.cpp — Wi-Fi station + UDP transmit/handshake path.
 //
-// Joins a normal Wi-Fi network and sends IMU packets as UDP datagrams to a
+// Joins a normal Wi-Fi network and sends telemetry as UDP datagrams to a
 // provisioned IP:port. Each packet carries a wearable ID so the receiver can
 // tell multiple sensors apart. A periodic HELLO/WELCOME handshake confirms the
-// link is live and learns the Pi's ID (round-trip connection test).
-// Credentials, target, wearable ID, and expected Pi ID persist in NVS.
+// link is live and learns the Pi's ID. Credentials, target, wearable ID, and
+// expected Pi ID persist in NVS.
 //
-// All messages share a 4-byte header:
-//   uint8  msg_type   (1=IMU, 2=HELLO, 3=WELCOME, 4=FORGET)
-//   uint8  version    (MSG_VERSION)
-//   uint16 wearable_id
+// Wire formats now live in mibs_wire.h and are shared with the BLE transport,
+// so the Pi and the app parse one format regardless of how a packet arrived.
 //
-// IMU packet (68 bytes) = header + :
-//   uint32 seq, uint32 t_ms, float ax,ay,az, gx,gy,gz, hx,hy,hz, temp_c,
-//   float hr, spo2, resp, hrv   (the 4 bio values are 0 from the real sensor,
-//   filled by the mock playback from chest/wrist reference data)
-// HELLO (8 bytes, wearable->Pi)   = header + uint32 nonce
-// WELCOME (12 bytes, Pi->wearable)= header + uint32 nonce + uint32 pi_id
-// FORGET (8 bytes, Pi->wearable)  = header + uint32 pi_id
-//   "unpair": erase stored credentials and drop off the WiFi. Accepted only
-//   when the wearable_id targets us (or is 0) and pi_id matches the last
-//   WELCOME (or we have not verified a Pi yet).
+// Telemetry is fire-and-forget, which is right for a 100 Hz stream. Impact
+// alerts are NOT: they are retransmitted until the Pi acks them by sequence
+// number. A dropped alert is the failure this product exists to prevent.
 // ---------------------------------------------------------------------------
 #include "wifi_udp_tx.h"
 
@@ -47,45 +38,11 @@ static const char *TAG = "wifi_udp";
 #define HELLO_PERIOD_MS   2000     // send a HELLO this often
 #define VERIFY_TIMEOUT_MS 6000     // "verified" if WELCOME seen within this window
 
-#define MSG_VERSION  1
-#define MSG_IMU      1
-#define MSG_HELLO    2
-#define MSG_WELCOME  3
-#define MSG_FORGET   4
-
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;
-    uint8_t  version;
-    uint16_t wearable_id;
-} msg_header_t;
-
-typedef struct __attribute__((packed)) {
-    msg_header_t hdr;
-    uint32_t seq;
-    uint32_t t_ms;
-    float    ax, ay, az;
-    float    gx, gy, gz;
-    float    hx, hy, hz;
-    float    temp_c;
-    // Mock biometrics (0 from the real IMU): heart rate, SpO2, respiration, HRV.
-    float    hr, spo2, resp, hrv;
-} imu_packet_t;
-
-typedef struct __attribute__((packed)) {
-    msg_header_t hdr;
-    uint32_t nonce;
-} hello_packet_t;
-
-typedef struct __attribute__((packed)) {
-    msg_header_t hdr;
-    uint32_t nonce;
-    uint32_t pi_id;
-} welcome_packet_t;
-
-typedef struct __attribute__((packed)) {
-    msg_header_t hdr;
-    uint32_t pi_id;
-} forget_packet_t;
+// Alert retransmission. The rx task wakes at least every 500 ms (socket
+// timeout), so that is the natural retry granularity.
+#define ALERT_PENDING_MAX   8
+#define ALERT_RETRY_MS      600
+#define ALERT_MAX_TRIES     6
 
 static volatile bool s_connected = false;
 static char          s_ip_str[16] = "0.0.0.0";
@@ -93,7 +50,7 @@ static int           s_sock       = -1;
 static struct sockaddr_in s_dest  = {};
 static volatile bool s_has_target = false;
 static portMUX_TYPE  s_lock       = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t      s_seq        = 0;   // touched only by the TX task
+static uint32_t      s_seq        = 0;
 static int           s_retry      = 0;
 
 static uint16_t      s_wearable_id     = 0;
@@ -103,7 +60,20 @@ static volatile uint32_t s_pi_id       = 0;
 static volatile int64_t  s_last_welcome_us = 0;
 static uint32_t      s_hello_nonce     = 0;
 static volatile bool s_has_creds       = false;
-static void (*s_forget_cb)(void)      = NULL;
+static volatile uint8_t s_mode         = 0;
+static void (*s_forget_cb)(void)       = NULL;
+static void (*s_link_cb)(bool)         = NULL;
+
+// Alerts sent but not yet acknowledged.
+typedef struct {
+    mibs_alert_pkt_t pkt;
+    int64_t          last_tx_us;
+    uint8_t          tries;
+    bool             used;
+} pending_alert_t;
+
+static pending_alert_t s_pending[ALERT_PENDING_MAX];
+static portMUX_TYPE    s_pend_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // --- NVS helpers ----------------------------------------------------------
 static void nvs_save_str(const char *key, const char *val)
@@ -133,8 +103,14 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        bool was = s_connected;
         s_connected = false;
         strcpy(s_ip_str, "0.0.0.0");
+        // Tell the controller immediately — this fires seconds before
+        // IP_EVENT_STA_LOST_IP, and every one of those seconds is alerts that
+        // would otherwise be handed to a dead socket.
+        if (was && s_link_cb) s_link_cb(false);
+
         // Only reconnect to a network we're provisioned for; a "forget" clears
         // s_has_creds first, so this also stops us re-joining after unpair.
         if (!s_has_creds) return;
@@ -142,13 +118,8 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         // Keep trying indefinitely — a wearable must auto-rejoin its own AP.
         // In particular, after an ungraceful power-off the receiver's AP can
         // hold a stale ("ghost") association for our MAC and reject re-auth
-        // (reason 2, "previous auth no longer valid") until it ages the ghost
-        // out. Giving up here is what left the board stuck after a power cycle.
-        // esp_wifi_connect() re-attempts (~2.4 s each), so this self-throttles.
+        // (reason 2) until it ages the ghost out.
         esp_wifi_connect();
-        // reason 2 stale-assoc/auth-expire, 201 NO_AP_FOUND (AP down/out of
-        // range), 15/204 wrong password, 205 generic. Log the first burst, then
-        // occasionally, so a long outage doesn't spam the console.
         if (s_retry <= WIFI_MAX_RETRY || s_retry % 10 == 0) {
             ESP_LOGW(TAG, "disconnected (reason=%d), reconnecting (attempt %d)",
                      e ? e->reason : -1, s_retry);
@@ -159,29 +130,39 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_connected = true;
         s_retry = 0;
         ESP_LOGI(TAG, "connected, ip=%s", s_ip_str);
+        if (s_link_cb) s_link_cb(true);
     }
+}
+
+// --- low-level send -------------------------------------------------------
+static bool get_dest(struct sockaddr_in *out)
+{
+    bool has;
+    portENTER_CRITICAL(&s_lock);
+    has = s_has_target;
+    if (has) *out = s_dest;
+    portEXIT_CRITICAL(&s_lock);
+    return has;
+}
+
+static int raw_send(const void *p, size_t n)
+{
+    struct sockaddr_in dest;
+    if (!s_connected || !get_dest(&dest)) return -1;
+    return sendto(s_sock, p, n, 0, (struct sockaddr *)&dest, sizeof(dest));
 }
 
 // --- Handshake ------------------------------------------------------------
 static void send_hello(void)
 {
-    struct sockaddr_in dest;
-    bool has;
-    portENTER_CRITICAL(&s_lock);
-    has = s_has_target;
-    if (has) dest = s_dest;
-    portEXIT_CRITICAL(&s_lock);
-    if (!has) return;
-
     s_hello_nonce = esp_random();
-    hello_packet_t h = {
-        .hdr = { MSG_HELLO, MSG_VERSION, s_wearable_id },
-        .nonce = s_hello_nonce,
-    };
-    sendto(s_sock, &h, sizeof(h), 0, (struct sockaddr *)&dest, sizeof(dest));
+    mibs_hello_pkt_t h = {};
+    h.hdr   = { MIBS_MSG_HELLO, MIBS_MSG_VERSION, s_wearable_id };
+    h.nonce = s_hello_nonce;
+    raw_send(&h, sizeof(h));
 }
 
-static void handle_welcome(const welcome_packet_t *w)
+static void handle_welcome(const mibs_welcome_pkt_t *w)
 {
     uint32_t pid = w->pi_id;
     if (s_expected_pi_id != 0 && s_expected_pi_id != pid) {
@@ -194,6 +175,48 @@ static void handle_welcome(const welcome_packet_t *w)
     s_last_welcome_us = esp_timer_get_time();
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "link verified with pi_id=%lu", (unsigned long)pid);
+}
+
+static void handle_alert_ack(const mibs_alert_ack_pkt_t *a)
+{
+    portENTER_CRITICAL(&s_pend_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        if (s_pending[i].used && s_pending[i].pkt.seq == a->seq) {
+            s_pending[i].used = false;
+            portEXIT_CRITICAL(&s_pend_lock);
+            ESP_LOGI(TAG, "alert %lu acked", (unsigned long)a->seq);
+            return;
+        }
+    }
+    portEXIT_CRITICAL(&s_pend_lock);
+}
+
+static void retry_pending_alerts(void)
+{
+    int64_t now = esp_timer_get_time();
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        mibs_alert_pkt_t copy;
+        bool go = false;
+
+        portENTER_CRITICAL(&s_pend_lock);
+        if (s_pending[i].used &&
+            (now - s_pending[i].last_tx_us) >= (int64_t)ALERT_RETRY_MS * 1000) {
+            if (s_pending[i].tries >= ALERT_MAX_TRIES) {
+                s_pending[i].used = false;   // give up; app_ctrl already logged it
+            } else {
+                s_pending[i].tries++;
+                s_pending[i].last_tx_us = now;
+                copy = s_pending[i].pkt;
+                go = true;
+            }
+        }
+        portEXIT_CRITICAL(&s_pend_lock);
+
+        if (go) {
+            ESP_LOGW(TAG, "retransmitting alert %lu", (unsigned long)copy.seq);
+            raw_send(&copy, sizeof(copy));
+        }
+    }
 }
 
 static void udp_rx_task(void *arg)
@@ -215,22 +238,28 @@ static void udp_rx_task(void *arg)
             send_hello();
             last_hello = now;
         }
+        retry_pending_alerts();
 
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         int n = recvfrom(s_sock, buf, sizeof(buf), 0,
                          (struct sockaddr *)&src, &slen);
-        if (n < (int)sizeof(msg_header_t)) continue;   // timeout or runt
+        if (n < (int)sizeof(mibs_hdr_t)) continue;   // timeout or runt
 
-        msg_header_t *h = (msg_header_t *)buf;
-        if (h->msg_type == MSG_WELCOME && n >= (int)sizeof(welcome_packet_t)) {
-            handle_welcome((welcome_packet_t *)buf);
-        } else if (h->msg_type == MSG_FORGET && n >= (int)sizeof(forget_packet_t)) {
-            forget_packet_t *f = (forget_packet_t *)buf;
+        mibs_hdr_t *h = (mibs_hdr_t *)buf;
+        if (h->msg_type == MIBS_MSG_WELCOME && n >= (int)sizeof(mibs_welcome_pkt_t)) {
+            handle_welcome((mibs_welcome_pkt_t *)buf);
+
+        } else if (h->msg_type == MIBS_MSG_ALERT_ACK &&
+                   n >= (int)sizeof(mibs_alert_ack_pkt_t)) {
+            handle_alert_ack((mibs_alert_ack_pkt_t *)buf);
+
+        } else if (h->msg_type == MIBS_MSG_FORGET && n >= (int)sizeof(mibs_forget_pkt_t)) {
+            mibs_forget_pkt_t *f = (mibs_forget_pkt_t *)buf;
             bool wid_ok = (f->hdr.wearable_id == 0 ||
                            f->hdr.wearable_id == s_wearable_id);
             bool pi_ok  = (s_pi_id == 0 || f->pi_id == s_pi_id);
-            if (f->hdr.version == MSG_VERSION && wid_ok && pi_ok) {
+            if (f->hdr.version == MIBS_MSG_VERSION && wid_ok && pi_ok) {
                 ESP_LOGW(TAG, "FORGET from pi_id=%lu — unpairing",
                          (unsigned long)f->pi_id);
                 if (s_forget_cb) s_forget_cb();   // must only post an event
@@ -259,6 +288,7 @@ esp_err_t wifi_udp_init(void)
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_mode(WIFI_MODE_STA);
+    // app_ctrl overrides this per mode (MAX_MODEM in ALERTS, NONE in LIVE).
     esp_wifi_set_ps(WIFI_PS_NONE);
     err = esp_wifi_start();
     if (err != ESP_OK) { ESP_LOGE(TAG, "wifi_start: %d", err); return err; }
@@ -300,8 +330,8 @@ esp_err_t wifi_udp_init(void)
 
     xTaskCreate(udp_rx_task, "udp_rx", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Wi-Fi/UDP ready (wearable_id=%u, local_port=%d)",
-             s_wearable_id, LOCAL_UDP_PORT);
+    ESP_LOGI(TAG, "Wi-Fi/UDP ready (wearable_id=%u, local_port=%d, imu_pkt=%u B)",
+             s_wearable_id, LOCAL_UDP_PORT, (unsigned)sizeof(mibs_imu_pkt_t));
     return ESP_OK;
 }
 
@@ -346,6 +376,11 @@ esp_err_t wifi_udp_forget(void)
     s_has_target = false;
     s_last_welcome_us = 0;
     portEXIT_CRITICAL(&s_lock);
+
+    portENTER_CRITICAL(&s_pend_lock);
+    memset(s_pending, 0, sizeof(s_pending));   // alerts belong to the old Pi
+    portEXIT_CRITICAL(&s_pend_lock);
+
     s_has_creds = false;   // stops the disconnect handler from reconnecting
     s_expected_pi_id = 0;
     s_pi_id = 0;
@@ -357,6 +392,8 @@ esp_err_t wifi_udp_forget(void)
 }
 
 void wifi_udp_set_forget_cb(void (*cb)(void)) { s_forget_cb = cb; }
+void wifi_udp_set_link_cb(void (*cb)(bool))   { s_link_cb = cb; }
+void wifi_udp_set_mode(uint8_t mode)          { s_mode = mode; }
 
 esp_err_t wifi_udp_set_target(const char *ip, uint16_t port)
 {
@@ -420,38 +457,97 @@ uint32_t wifi_udp_get_pi_id(void) { return s_pi_id; }
 
 void wifi_udp_get_ip(char *buf, size_t n) { strlcpy(buf, s_ip_str, n); }
 
-esp_err_t wifi_udp_send_imu_bio(const lsm6_sample_t *s,
+esp_err_t wifi_udp_send_imu_bio(const mibs_message *m, float temp,
                                 float hr, float spo2, float resp, float hrv)
 {
-    if (!s) return ESP_ERR_INVALID_ARG;
-    if (!s_connected) return ESP_OK;
+    if (!m) return ESP_ERR_INVALID_ARG;
 
     struct sockaddr_in dest;
-    bool has;
-    portENTER_CRITICAL(&s_lock);
-    has = s_has_target;
-    if (has) dest = s_dest;
-    portEXIT_CRITICAL(&s_lock);
-    if (!has) return ESP_OK;
+    if (!s_connected || !get_dest(&dest)) return ESP_ERR_INVALID_STATE;
 
-    imu_packet_t pkt = {
-        .hdr   = { MSG_IMU, MSG_VERSION, s_wearable_id },
-        .seq   = s_seq++,
-        .t_ms  = (uint32_t)(esp_timer_get_time() / 1000),
-        .ax = s->ax_g,   .ay = s->ay_g,   .az = s->az_g,
-        .gx = s->gx_dps, .gy = s->gy_dps, .gz = s->gz_dps,
-        .hx = s->hx_g,   .hy = s->hy_g,   .hz = s->hz_g,
-        .temp_c = s->temp_c,
-        .hr = hr, .spo2 = spo2, .resp = resp, .hrv = hrv,
-    };
+    // Three tasks can reach this now (IMU, mock playback timer, app_ctrl), so
+    // the sequence counter is no longer single-writer.
+    uint32_t seq;
+    portENTER_CRITICAL(&s_lock);
+    seq = s_seq++;
+    portEXIT_CRITICAL(&s_lock);
+
+    mibs_imu_pkt_t pkt = {};
+    pkt.hdr = { MIBS_MSG_IMU, MIBS_MSG_VERSION, s_wearable_id };
+    pkt.seq                = seq;
+    pkt.t_ms               = (uint32_t)(esp_timer_get_time() / 1000);
+    pkt.impact_count       = m->impact_count;
+    pkt.impact_threshold   = m->impact_threshold;
+    pkt.impact_accumulator = m->impact_accumulator;
+    pkt.all_time_peak_g    = m->all_time_peak_g;
+    pkt.temp_c             = temp;
+    pkt.hr = hr; pkt.spo2 = spo2; pkt.resp = resp; pkt.hrv = hrv;
+    pkt.mode               = s_mode;
 
     int n = sendto(s_sock, &pkt, sizeof(pkt), 0,
                    (struct sockaddr *)&dest, sizeof(dest));
     return (n == (int)sizeof(pkt)) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t wifi_udp_send_imu(const lsm6_sample_t *s)
+esp_err_t wifi_udp_send_imu(const mibs_message *m)
 {
     // Real sensor path: no biometric channels.
-    return wifi_udp_send_imu_bio(s, 0.0f, 0.0f, 0.0f, 0.0f);
+    return wifi_udp_send_imu_bio(m, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+esp_err_t wifi_udp_send_alert(const mibs_impact_t *imp)
+{
+    if (!imp) return ESP_ERR_INVALID_ARG;
+
+    struct sockaddr_in dest;
+    if (!s_connected || !get_dest(&dest)) return ESP_ERR_INVALID_STATE;
+
+    mibs_alert_pkt_t pkt = {};
+    pkt.hdr = { MIBS_MSG_ALERT, MIBS_MSG_VERSION, s_wearable_id };
+    pkt.seq         = imp->seq;
+    pkt.t_ms        = (uint32_t)(imp->t_us / 1000);
+    pkt.peak_g      = imp->peak_g;
+    pkt.threshold_g = imp->threshold_g;
+    pkt.hx_g = imp->hx_g; pkt.hy_g = imp->hy_g; pkt.hz_g = imp->hz_g;
+    pkt.gx_dps = imp->gx_dps; pkt.gy_dps = imp->gy_dps; pkt.gz_dps = imp->gz_dps;
+    pkt.dur_ms = imp->dur_ms;
+    pkt.mode   = imp->mode;
+    pkt.xport  = imp->xport;
+
+    // Park it for retransmission before the first send, so an ack that races
+    // back cannot arrive before there is anything to match it against.
+    int slot = -1;
+    portENTER_CRITICAL(&s_pend_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        if (!s_pending[i].used) { slot = i; break; }
+    }
+    if (slot >= 0) {
+        s_pending[slot].pkt        = pkt;
+        s_pending[slot].last_tx_us = esp_timer_get_time();
+        s_pending[slot].tries      = 1;
+        s_pending[slot].used       = true;
+    }
+    portEXIT_CRITICAL(&s_pend_lock);
+
+    if (slot < 0) {
+        ESP_LOGE(TAG, "alert pending queue full — caller must buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int n = sendto(s_sock, &pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&dest, sizeof(dest));
+    if (n != (int)sizeof(pkt)) {
+        ESP_LOGW(TAG, "alert %lu first send failed — will retry",
+                 (unsigned long)pkt.seq);
+    }
+    return ESP_OK;   // accepted for reliable delivery
+}
+
+uint8_t wifi_udp_alerts_pending(void)
+{
+    uint8_t n = 0;
+    portENTER_CRITICAL(&s_pend_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) if (s_pending[i].used) n++;
+    portEXIT_CRITICAL(&s_pend_lock);
+    return n;
 }

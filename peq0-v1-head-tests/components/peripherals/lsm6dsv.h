@@ -29,6 +29,13 @@ typedef struct {
     float temp_c;                    // Temperature (°C)
 } lsm6_sample_t;
 
+typedef struct {
+        uint32_t impact_count;
+        float impact_threshold;
+        float impact_accumulator;
+        float all_time_peak_g;
+} mibs_message;
+
 esp_err_t lsm6_init(int sda, int scl);
 esp_err_t lsm6_deinit(void);
 esp_err_t lsm6_scan(int *out_count);
