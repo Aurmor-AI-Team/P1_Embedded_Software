@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Stream biometric data over BLE (GATT notifications) to the mobile app.
 
-The Raspberry Pi acts as a BLE *peripheral*: it advertises ``aurmor-rpi``,
-exposes one service with Meta (read), Data (notify), Control (write) and
-WifiCreds (read) characteristics, and streams binary-v1 records (see
-protocol.py). The React Native app (react-native-ble-plx, a BLE *central*)
-scans by name, connects, reads Meta for the decode tables, and subscribes to
-the Data characteristic.
+The Raspberry Pi acts as a BLE *peripheral*: it advertises its unique per-Pi
+name (``aurmor-rpi-<macsuffix>`` from its config; ``aurmor-rpi`` only when no
+config exists), exposes one service with Meta (read), Data (notify), Control
+(write) and WifiCreds (read) characteristics, and streams binary-v1 records
+(see protocol.py). The React Native app (react-native-ble-plx, a BLE *central*)
+scans by service UUID, connects, verifies the receiver's name against the
+registered devices, reads Meta for the decode tables, and subscribes to the
+Data characteristic.
 
 Two sources:
   --source udp (default)  live IMU samples from ESP32 wearables on the Pi's
@@ -394,6 +396,23 @@ class BleSender:
                 raise SystemExit("no Bluetooth adapter found.")
             addr = available[0].address
 
+        # The app registers/verifies a receiver by its GAP *adapter* name
+        # (Android's BluetoothDevice.getName / iOS peripheral.name / GATT char
+        # 0x2A00), NOT just the advertisement LocalName that `local_name` below
+        # sets. The OS image ships a shared adapter name ("aurmor-device"), so
+        # every Pi would look identical and collide on the backend's unique
+        # serial. Align the adapter name with our unique per-Pi name so all three
+        # (adapter name, GATT name, advertisement) agree. Best-effort: BlueZ/
+        # bluezero setter support varies, and a failure just leaves the old name.
+        try:
+            dongle = adapter.Adapter(addr)
+            if dongle.alias != self.name:
+                dongle.alias = self.name
+                print(f"Set adapter name to {self.name!r}.")
+        except Exception as exc:  # noqa: BLE001 - defensive, name is non-critical
+            print(f"# could not set adapter name to {self.name!r}: {exc}",
+                  file=sys.stderr)
+
         periph = peripheral.Peripheral(addr, local_name=self.name)
         periph.add_service(srv_id=1, uuid=protocol.SERVICE_UUID, primary=True)
         periph.add_characteristic(
@@ -517,8 +536,10 @@ def parse_args(argv=None):
     p.add_argument("--pose-file", default=None,
                    help="UIP pose_seq.csv path (default: "
                         "<repo>/ik-model/results/<exercise>/madgwick/pose_seq.csv)")
-    p.add_argument("--name", default=protocol.DEFAULT_DEVICE_NAME,
-                   help="BLE advertised name (default: %(default)s)")
+    p.add_argument("--name", default=None,
+                   help="BLE advertised name (default: the receiver's unique "
+                        "name from its config, e.g. aurmor-rpi-3f48; falls back "
+                        "to aurmor-rpi when no config exists)")
     p.add_argument("--chunk-size", type=int, default=protocol.DEFAULT_CHUNK_SIZE,
                    help="max notification payload in bytes; keep <= MTU-3 "
                         "(default: %(default)s; raise to ~180 once MTU is negotiated)")
@@ -577,7 +598,11 @@ def main_udp(args) -> None:
                       field_specs, layouts, node_layout,
                       period_ms=args.live_period_ms)
 
-    BleSender([], meta, args.name, args.adapter,
+    # Advertise the receiver's unique per-Pi name so the app registers it under a
+    # distinct serial (the shared "aurmor-rpi" collides on the backend's unique
+    # serial column). --name still overrides for manual runs.
+    name = args.name or cfg["receiver_name"]
+    BleSender([], meta, name, args.adapter,
               args.chunk_size, args.speed, args.loop, args.verbose,
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,
@@ -618,12 +643,19 @@ def main(argv=None):
         return
 
     # Serve WiFi creds in csv mode too when a receiver config already exists
-    # (lets provisioning be tested against the replay source).
+    # (lets provisioning be tested against the replay source). When a config
+    # exists, also advertise its unique per-Pi name so pairing registers a
+    # distinct serial; otherwise fall back to the shared default.
     cfg_path = Path(args.config).expanduser() if args.config else wifi_ap.DEFAULT_CONFIG_PATH
-    creds = wifi_ap.wifi_creds_json(wifi_ap.load_config(cfg_path)) \
-        if cfg_path.exists() else b"{}"
+    if cfg_path.exists():
+        cfg = wifi_ap.load_config(cfg_path)
+        creds = wifi_ap.wifi_creds_json(cfg)
+        name = args.name or cfg["receiver_name"]
+    else:
+        creds = b"{}"
+        name = args.name or protocol.DEFAULT_DEVICE_NAME
 
-    BleSender(frames, meta, args.name, args.adapter,
+    BleSender(frames, meta, name, args.adapter,
               args.chunk_size, args.speed, args.loop, args.verbose,
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,

@@ -38,22 +38,37 @@ _DEFAULTS = {
 }
 
 
-def _iface_mac_suffix(ifname: str):
-    """Last two bytes of an interface MAC as 4 hex chars, or None if unreadable."""
+def _pi_serial_suffix():
+    """Last 4 hex chars of the Raspberry Pi's unique board serial, or None off-Pi.
+
+    The board serial is stable, globally unique per unit, readable before any
+    network interface comes up, and immune to MAC randomization — a better
+    identity source than the WiFi MAC.
+    """
+    serial = ""
+    # Device-tree node (preferred): a NUL-terminated ASCII serial string.
     try:
-        mac = Path(f"/sys/class/net/{ifname}/address").read_text().strip()
+        raw = Path("/sys/firmware/devicetree/base/serial-number").read_bytes()
+        serial = raw.split(b"\x00", 1)[0].decode("ascii", "ignore")
     except OSError:
-        return None
-    parts = mac.split(":")
-    if len(parts) != 6:
-        return None
-    return (parts[4] + parts[5]).lower()
+        pass
+    if not serial:
+        # Fallback: the "Serial" line in /proc/cpuinfo.
+        try:
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.lower().startswith("serial"):
+                    serial = line.split(":", 1)[1]
+                    break
+        except OSError:
+            pass
+    serial = "".join(c for c in serial.lower() if c in "0123456789abcdef")
+    return serial[-4:] if len(serial) >= 4 else None
 
 
-def _unique_suffix(ifname: str) -> str:
-    # MAC-derived is stable + human-recognizable; random is the fallback (e.g.
-    # on a dev host with no such interface). Either way it is stored once.
-    return _iface_mac_suffix(ifname) or secrets.token_hex(2)
+def _unique_suffix() -> str:
+    # Pi board serial is stable + human-recognizable; random is the fallback
+    # (e.g. on a dev host). Either way it is stored once in receiver_config.json.
+    return _pi_serial_suffix() or secrets.token_hex(2)
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
@@ -74,7 +89,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
     # receiver) and a matching human-readable receiver name, sharing one suffix.
     ssid = cfg.get("ap_ssid")
     if not ssid or ssid == _LEGACY_SHARED_SSID:
-        suffix = _unique_suffix(cfg["ap_ifname"])
+        suffix = _unique_suffix()
         cfg["ap_ssid"] = f"aurmor-pi-{suffix}"
         cfg["receiver_name"] = f"aurmor-rpi-{suffix}"
         changed = True

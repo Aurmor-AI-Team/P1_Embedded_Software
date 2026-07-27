@@ -118,8 +118,13 @@ size need **not** align with record boundaries.
   sudo systemctl restart polkit
   ```
 - **`receiver_config.json`** — created next to the script on first run with a
-  generated AP password and `pi_id`; served to the app via **WifiCreds**. It
-  holds a secret — it is git-ignored, don't commit it.
+  generated AP password and `pi_id`, plus a unique per-Pi identity (hidden SSID
+  `aurmor-pi-<suffix>` + BLE name `aurmor-rpi-<suffix>`) whose `<suffix>` is the
+  last 4 hex of the **Raspberry Pi board serial** (`/proc/cpuinfo` Serial /
+  device-tree `serial-number`; random fallback off-Pi). Served to the app via
+  **WifiCreds**. Holds a secret — git-ignored, don't commit it. **Delete this
+  file before capturing a distributable image** so each cloned Pi regenerates
+  its own identity from its own serial instead of sharing the golden Pi's.
 - **Wearable IDs** — every UDP packet carries a `wearable_id`; `udp_source.py`
   maps them to body nodes (`WID_TO_NODE = {1:HEAD, 2:WA, 3:WD, 4:WE}`, one per
   body position the app assigns at pairing). Packets from unmapped IDs are
