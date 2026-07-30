@@ -29,6 +29,11 @@ _LEGACY_SHARED_SSID = "aurmor-pi-ap"
 
 _DEFAULTS = {
     "ap_con_name": "aurmor-ap",
+    # The Pi's built-in radio (brcmfmac) associates roughly 8-10 stations before
+    # it becomes unreliable, which is a chip-firmware limit, not a setting. For
+    # a squad, point this at a USB adapter (usually wlan1) whose driver uses
+    # mac80211 properly. Run `python3 wifi_ap.py --probe` to see what the Pi
+    # has and which interfaces actually advertise AP mode.
     "ap_ifname": "wlan0",
     # Channels 1/6/11 are active-scannable in every regulatory domain. An
     # auto-picked 12/13 is passive-scan-only for world-domain ESP32s, and a
@@ -36,6 +41,19 @@ _DEFAULTS = {
     "ap_channel": 6,
     "udp_port": 5005,
 }
+
+
+def main(argv=None) -> int:
+    import argparse
+    p = argparse.ArgumentParser(description="Hidden AP helper / interface probe")
+    p.add_argument("--probe", action="store_true",
+                   help="list wireless interfaces and their AP capability")
+    args = p.parse_args(argv)
+    if args.probe:
+        return print_probe()
+    cfg = load_config()
+    print(json.dumps({k: v for k, v in cfg.items() if k != "ap_password"}, indent=2))
+    return 0
 
 
 def _pi_serial_suffix():
@@ -119,6 +137,103 @@ def wifi_creds_json(cfg: dict) -> bytes:
         "pi_id": cfg["pi_id"],
         "receiver_name": cfg["receiver_name"],
     }, separators=(",", ":")).encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Interface probe: which radio should host the AP?
+# --------------------------------------------------------------------------- #
+# Chipsets whose in-kernel mac80211 drivers do AP mode properly. The number is
+# a realistic associated-station count for a squad of wearables that all
+# transmit on a cadence — NOT the driver's theoretical max, which is meaningless
+# once 802.11 contention is taken into account.
+KNOWN_AP_CHIPSETS = {
+    "mt7921u":  ("MediaTek MT7921AU (WiFi 6)", 64),
+    "mt7921":   ("MediaTek MT7921", 64),
+    "mt76x2u":  ("MediaTek MT7612U", 48),
+    "mt76":     ("MediaTek mt76 family", 48),
+    "ath9k_htc": ("Atheros AR9271 (2.4 GHz only)", 24),
+    "carl9170": ("Atheros AR9170", 16),
+    "brcmfmac": ("Broadcom/Cypress — Pi built-in, AP mode is firmware-limited", 8),
+    "rtl8xxxu": ("Realtek (in-kernel)", 16),
+}
+
+
+def _iw(args: list) -> str:
+    try:
+        r = subprocess.run(["iw", *args], capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else ""
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def probe_ap_interfaces() -> list:
+    """Report every wireless interface and whether it can host the AP.
+
+    Answers the question you actually have when a dongle arrives: did the Pi
+    see it, does its driver advertise AP mode, and is it the built-in radio
+    (~8 stations) or something that can carry a squad?
+    """
+    out = []
+    dev = _iw(["dev"])
+    ifaces = [ln.split()[-1] for ln in dev.splitlines()
+              if ln.strip().startswith("Interface")]
+    for name in ifaces:
+        driver = ""
+        try:
+            driver = Path(f"/sys/class/net/{name}/device/driver").resolve().name
+        except OSError:
+            pass
+        phy = ""
+        try:
+            phy = Path(f"/sys/class/net/{name}/phy80211").resolve().name
+        except OSError:
+            pass
+        info = _iw(["phy", phy, "info"]) if phy else ""
+        modes = info.split("Supported interface modes:", 1)
+        ap_capable = False
+        if len(modes) > 1:
+            block = modes[1].split("Band ", 1)[0]
+            ap_capable = any(ln.strip() == "* AP" for ln in block.splitlines())
+        label, stations = KNOWN_AP_CHIPSETS.get(
+            driver, (driver or "unknown driver", None))
+        out.append({
+            "interface": name,
+            "phy": phy,
+            "driver": driver,
+            "chipset": label,
+            "ap_capable": ap_capable,
+            "realistic_stations": stations,
+            "builtin": driver == "brcmfmac",
+        })
+    return out
+
+
+def print_probe() -> int:
+    rows = probe_ap_interfaces()
+    if not rows:
+        print("no wireless interfaces found (is `iw` installed? "
+              "sudo apt install -y iw)", file=sys.stderr)
+        return 1
+    print(f"{'iface':8} {'driver':12} {'AP?':4} {'~stations':10} chipset")
+    for r in rows:
+        n = r["realistic_stations"]
+        print(f"{r['interface']:8} {r['driver'][:12]:12} "
+              f"{'yes' if r['ap_capable'] else 'NO':4} "
+              f"{(str(n) if n else '?'):10} {r['chipset']}")
+    best = max((r for r in rows if r["ap_capable"]),
+               key=lambda r: r["realistic_stations"] or 0, default=None)
+    if best is None:
+        print("\nNo interface advertises AP mode. A USB adapter with an "
+              "in-kernel mac80211 driver (mt7921u / mt76x2u) is the fix.")
+        return 1
+    print(f"\nBest AP interface: {best['interface']} ({best['chipset']})")
+    if best["builtin"]:
+        print("This is the Pi's built-in radio — expect ~8 stations. For a "
+              "squad, add a USB adapter and set \"ap_ifname\" in "
+              "receiver_config.json to its interface (usually wlan1).")
+    else:
+        print(f'Set "ap_ifname": "{best["interface"]}" in receiver_config.json.')
+    return 0
 
 
 def _nmcli(args: list, **kwargs) -> subprocess.CompletedProcess:
@@ -211,3 +326,7 @@ def ensure_ap(cfg: dict) -> bool:
     except Exception as exc:  # AP is best-effort; the BLE stream must come up
         print(f"# wifi-ap: unexpected error: {exc}", file=sys.stderr)
         return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())

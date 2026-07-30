@@ -30,10 +30,14 @@ import threading
 import time
 from pathlib import Path
 
+import impact_store as impact_store_mod
 import pose as pose_mod
+import roster as roster_mod
+import session as session_mod
 import protocol
 import replay
 import wifi_ap
+import udp_source as udp_source_mod
 from udp_source import UdpImuSource
 
 
@@ -53,7 +57,8 @@ def resolve_pose_file(args, exercise: str) -> Path:
 
 
 def build_meta(exercise: str, frames, nodes, chunk_size: int,
-               field_specs, layouts, node_layout, period_ms=None) -> bytes:
+               field_specs, layouts, node_layout, period_ms=None,
+               roster=None, session=None, node_meta=None) -> bytes:
     per = replay.period_ms(frames) if period_ms is None else period_ms
     descriptor = {
         "exercise": exercise,
@@ -68,6 +73,22 @@ def build_meta(exercise: str, frames, nodes, chunk_size: int,
         "field_specs": field_specs,   # name -> [type, scale]
         "layouts": layouts,           # ordered field-name lists (no node/t_s)
         "node_layout": node_layout,   # node index -> layouts index
+        # Head-impact stream: MSG_IMPACT records carry their own fixed layout,
+        # published here so the app can render a hit without a Meta round-trip.
+        "impact": protocol.impact_meta(),
+        "summary": protocol.summary_meta(),
+        "capacity": {
+            "max_athletes": protocol.MAX_ATHLETES,
+            "max_devices": protocol.MAX_DEVICES,
+            "max_devices_per_athlete": protocol.MAX_DEVICES_PER_ATHLETE,
+            "focus_max_nodes": protocol.FOCUS_MAX_NODES,
+            "udp_budget_pps": protocol.UDP_PACKET_BUDGET_PPS,
+        },
+        # Who each node belongs to. An athlete may wear several sensors, so a
+        # node is (athlete, body position) — never just a person.
+        "node_meta": node_meta or [],
+        "roster": roster or {"athletes": []},
+        "session": session or "",
     }
     return json.dumps(descriptor, separators=(",", ":")).encode("utf-8")
 
@@ -107,7 +128,9 @@ class BleSender:
                  chunk_size, speed, loop, verbose,
                  nodes, field_specs, layouts, node_layout,
                  button_pin=None, power_button=False, pose_seq=None,
-                 source=None, live_period_ms=100, wifi_creds_bytes=b"{}"):
+                 source=None, live_period_ms=100, wifi_creds_bytes=b"{}",
+                 impacts=None, pi_id=0, roster=None, chunk_size_meta=None,
+                 group_session=None):
         self.frames = frames
         self.pose_seq = pose_seq
         self.meta_bytes = meta_bytes
@@ -121,6 +144,25 @@ class BleSender:
         self.chunk_size = chunk_size
         self.source = source  # UdpImuSource when live; None = CSV replay
         self.wifi_creds_bytes = wifi_creds_bytes
+        self.impacts = impacts        # ImpactStore, or None outside live mode
+        self.pi_id = pi_id
+        self.roster = roster          # roster.Roster, or None outside live mode
+        self.wire_schema = 'agg'      # v2 impact aggregates by default
+        # Squad scheduling state.
+        self._node_seen = {}          # node -> (monotonic, mode, rate_hz)
+        self._node_rx = {}            # node -> packets since last summary
+        self._last_summary = 0.0
+        self._summary_period_s = 1.0
+        self._last_govern = 0.0
+        self.group = group_session      # session.GroupSession, or None
+        self._last_cov_tick = 0.0
+        # Records the BLE link can carry per tick, from the budget.
+        self._tick_budget = max(1, int(protocol.BLE_RECORD_BUDGET_PER_S
+                                       * (live_period_ms / 1000.0)))
+        self._impacts_cache = b'{"athletes":[]}'
+        self._roster_cache = b'{"athletes":[]}'
+        self._roster_wbuf = bytearray()   # long-write reassembly
+        self._roster_rev_sent = -1
         if source is not None:
             self.frame_interval_ms = max(1, int(live_period_ms))
         else:
@@ -167,11 +209,127 @@ class BleSender:
         offset = int(options.get("offset", 0))
         if offset == 0:
             active = self.source.active_wearables() if self.source else {}
-            self._wearables_cache = json.dumps(
-                {"active": [{"wid": wid, "node": node}
-                            for wid, node in sorted(active.items())]},
-                separators=(",", ":")).encode("utf-8")
+            # Unassigned boards are the whole point of this characteristic now:
+            # a fresh receiver has an EMPTY roster, so until the user assigns
+            # devices every wearable shows up here and nowhere else.
+            unassigned = (self.source.unassigned_wearables() if self.source else [])
+            modes = self.source.modes() if self.source else {}
+            self._wearables_cache = json.dumps({
+                "roster_revision": self.roster.revision if self.roster else 0,
+                "active": [{"wid": wid, "node": node, "mode": modes.get(wid)}
+                           for wid, node in sorted(active.items())],
+                "unassigned": unassigned,
+                "positions": roster_mod.POSITIONS,
+            }, separators=(",", ":")).encode("utf-8")
         return list(self._wearables_cache[offset:])
+
+    def impacts_read(self, options):
+        """Per-athlete head-impact summary for the app's roster screen.
+
+        Rendered once at offset 0 so a read-blob continuation can't tear across
+        an incoming impact (the same reason wearables_read does it).
+        """
+        offset = int(options.get("offset", 0))
+        if offset == 0:
+            summary = (self.impacts.summary(self.pi_id) if self.impacts
+                       else {"athletes": []})
+            if self.roster is not None:
+                summary["capacity"] = roster_mod.capacity(self.roster)
+            if self.source is not None:
+                summary["rate"] = self.source.rate_stats()
+                summary["focus"] = self.source.focus
+            if self.group is not None:
+                # Coverage travels WITH the impact counts, never separately —
+                # a count without its coverage is not interpretable.
+                summary["session_report"] = self.group.report()
+            self._impacts_cache = json.dumps(
+                summary, separators=(",", ":")).encode("utf-8")
+        return list(self._impacts_cache[offset:])
+
+    # -- roster (the app owns this) ----------------------------------------- #
+    def roster_read(self, options):
+        offset = int(options.get("offset", 0))
+        if offset == 0:
+            doc = self.roster.as_dict() if self.roster else {"athletes": []}
+            doc["positions"] = roster_mod.POSITIONS
+            self._roster_cache = json.dumps(
+                doc, separators=(",", ":")).encode("utf-8")
+        return list(self._roster_cache[offset:])
+
+    def roster_write(self, value, options):
+        """Accept a roster document from the app.
+
+        A roster easily exceeds one ATT write, so BlueZ delivers it as a
+        prepare-write sequence with increasing offsets. Reassemble on offset,
+        and only commit once the buffer parses as JSON — a half-delivered
+        roster must never be applied, or athletes silently stop being monitored
+        mid-write.
+        """
+        if self.roster is None:
+            print("# roster: write ignored (no live source)", file=sys.stderr)
+            return
+        offset = int(options.get("offset", 0))
+        chunk = bytes(value)
+        if offset == 0:
+            self._roster_wbuf = bytearray()
+        if offset != len(self._roster_wbuf):
+            # Out-of-order or resumed write: pad/truncate to keep offsets honest.
+            self._roster_wbuf = self._roster_wbuf[:offset]
+            self._roster_wbuf.extend(b"\x00" * (offset - len(self._roster_wbuf)))
+        self._roster_wbuf.extend(chunk)
+
+        try:
+            doc = json.loads(self._roster_wbuf.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return          # more chunks still coming
+        self._roster_wbuf = bytearray()
+        self.apply_roster(doc)
+
+    def apply_roster(self, doc):
+        """Validate, persist, and propagate a roster edit."""
+        try:
+            applied = self.roster.apply(doc)
+        except roster_mod.RosterError as exc:
+            print(f"# roster: REJECTED ({exc})", file=sys.stderr)
+            return False
+        if self.source is not None:
+            self.source.set_roster(self.roster)
+        if self.impacts is not None:
+            self.impacts.set_roster(self.roster)
+        n_dev = len(self.roster.assigned_wids())
+        n_head = len(self.roster.head_wids())
+        print(f"# roster rev {applied['revision']}: "
+              f"{len(applied['athletes'])} athlete(s), {n_dev} device(s), "
+              f"{n_head} head sensor(s)", file=sys.stderr)
+        # Node list changed -> the app's decode tables are stale. Republish.
+        self.refresh_meta()
+        return True
+
+    def refresh_meta(self):
+        """Rebuild and re-send Meta after a roster change.
+
+        Node indices are append-only (see roster.py), so a sample already in
+        flight still decodes correctly against the old table — but anything for
+        a NEW node would be undecodable until the app sees this.
+        """
+        if self.roster is None:
+            return
+        nodes = self.roster.nodes()
+        field_specs, layouts, node_layout = protocol.build_live_protocol_meta(
+            nodes, schema=self.wire_schema)
+        self.field_specs = field_specs
+        self.layouts = layouts
+        self.node_layout = node_layout
+        self.node_index = {node: i for i, node in enumerate(nodes)}
+        self.meta_bytes = build_meta(
+            "live-udp", [], nodes, self.chunk_size,
+            field_specs, layouts, node_layout,
+            period_ms=self.frame_interval_ms,
+            roster=self.roster.as_dict(),
+            session=self.impacts.session if self.impacts else "",
+            node_meta=self.roster.node_meta())
+        self._roster_rev_sent = self.roster.revision
+        self._send_meta()
 
     def control_write(self, value, options):
         cmd = bytes(value).decode("utf-8", "ignore").strip().lower()
@@ -180,6 +338,82 @@ class BleSender:
             self.start()
         elif cmd == "stop":
             self.stop()
+        elif parts and parts[0] == "focus":
+            # "focus <node> [node ...]" — the nodes the app is displaying get
+            # full-rate telemetry. "focus" with no args clears it.
+            if self.source is not None:
+                chosen = self.source.set_focus(parts[1:])
+                print(f"# focus: {chosen or 'none'}", file=sys.stderr)
+        elif parts and parts[0] == "rate":
+            # "rate [hz]" — force a telemetry rate, or re-run the governor.
+            if self.source is not None:
+                hz = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                if hz is None:
+                    self.source.govern()
+                else:
+                    for wid in self.roster.assigned_wids():
+                        self.source.send_config(wid, rate_hz=hz)
+                    print(f"# rate: forced {hz} Hz on "
+                          f"{len(self.roster.assigned_wids())} device(s)",
+                          file=sys.stderr)
+        elif parts and parts[0] == "mode" and len(parts) >= 2:
+            # "mode alerts|live" — push a policy to the whole squad.
+            policy = {"alerts": 0, "live": 1, "mock": 2}.get(parts[1])
+            if policy is not None and self.source is not None:
+                self.source.govern(policy=policy)
+        elif parts and parts[0] == "assign" and len(parts) >= 4:
+            # "assign <wid> <athlete_id> <position>" — incremental setup path
+            try:
+                self.roster.assign(int(parts[1]), parts[2], parts[3])
+            except (ValueError, AttributeError, roster_mod.RosterError) as exc:
+                print(f"# control: assign failed ({exc})", file=sys.stderr)
+            else:
+                self.apply_roster(self.roster.as_dict())
+        elif parts and parts[0] == "unassign" and len(parts) >= 2:
+            try:
+                self.roster.unassign(int(parts[1]))
+            except (ValueError, AttributeError, roster_mod.RosterError) as exc:
+                print(f"# control: unassign failed ({exc})", file=sys.stderr)
+            else:
+                self.apply_roster(self.roster.as_dict())
+        elif parts and parts[0] == "session":
+            sub = parts[1] if len(parts) > 1 else "status"
+            if self.group is None:
+                print("# control: no group session (csv source?)", file=sys.stderr)
+            elif sub == "start":
+                info = self.group.start(name=parts[2] if len(parts) > 2 else None)
+                print(f"# session start: {info}", file=sys.stderr)
+                if info["without_sensor"]:
+                    # Loud on purpose: an athlete with no sensor is invisible
+                    # for the whole session, and now is the only moment anyone
+                    # can still fix it.
+                    print(f"# WARNING: no sensor assigned to "
+                          f"{', '.join(info['without_sensor'])}", file=sys.stderr)
+                self.refresh_meta()
+            elif sub == "end":
+                self.group.end()
+                print(self.group.text_report(), file=sys.stderr)
+            else:
+                print(self.group.text_report(), file=sys.stderr)
+        elif parts and parts[0] == "athlete" and len(parts) >= 2:
+            # "athlete <name...>" — register a squad member with no device yet.
+            try:
+                self.roster.add_athlete(" ".join(parts[1:]))
+            except (AttributeError, roster_mod.RosterError) as exc:
+                print(f"# control: add athlete failed ({exc})", file=sys.stderr)
+            else:
+                self.apply_roster(self.roster.as_dict())
+        elif parts and parts[0] == "hand" and len(parts) >= 3:
+            # "hand <wid> <athlete_id>" — the group check-in path: one tap on
+            # an athlete, one on a device from the unassigned list.
+            try:
+                self.roster.assign_head(int(parts[1]), parts[2])
+            except (ValueError, AttributeError, roster_mod.RosterError) as exc:
+                print(f"# control: hand failed ({exc})", file=sys.stderr)
+            else:
+                self.apply_roster(self.roster.as_dict())
+        elif cmd == "impacts":
+            self._send_impact_backlog()
         elif parts and parts[0] == "forget":
             wid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             if self.source is not None:
@@ -224,14 +458,43 @@ class BleSender:
         for chunk in protocol.chunk_bytes(message, self.chunk_size):
             self.data_char.set_value(list(chunk))
 
+    def _send_record(self, msg_type, payload):
+        """Frame + chunk one record onto the Data characteristic."""
+        if self.data_char is None:
+            return
+        message = protocol.frame_record(msg_type, payload)
+        for chunk in protocol.chunk_bytes(message, self.chunk_size):
+            self.data_char.set_value(list(chunk))
+
+    def _send_impact_backlog(self):
+        """Replay every impact of the current session to a fresh subscriber.
+
+        The whole point of buffering impacts on the Pi: the phone can be out of
+        range, locked, or backgrounded when an athlete takes a hit. On reconnect
+        it must receive what it missed, not just what happens next.
+        """
+        if self.impacts is None:
+            return
+        events = self.impacts.backlog()
+        if not events:
+            return
+        for event in events:
+            self._send_record(protocol.MSG_IMPACT,
+                              protocol.encode_impact_binary(event))
+        print(f"# replayed {len(events)} buffered impact(s) to the app",
+              file=sys.stderr)
+
     def start(self):
         self.frame_idx = 0
         self.running = True
         if self.source is not None:
-            self.source.drain()  # discard backlog accumulated while unsubscribed
+            # Telemetry backlog is discarded (it is stale and disposable);
+            # impacts are NOT — they are replayed below.
+            self.source.drain()
         # Always (re)send Meta first so a fresh subscriber — or a restart/loop —
         # can decode the samples that follow.
         self._send_meta()
+        self._send_impact_backlog()
         if not self.timer_active:
             self.timer_active = True
             # bluezero renamed add_timeout() -> add_timer_ms(); support both.
@@ -283,27 +546,109 @@ class BleSender:
         if not self.running or self.data_char is None:
             self.timer_active = False
             return False
-        samples = self.source.drain()
-        if not samples:
-            now = time.monotonic()
-            if now - self._last_wait_log >= 5.0:
-                print("# waiting for UDP data from wearables…", file=sys.stderr)
-                self._last_wait_log = now
-            return True
-        for sample in samples:
+        now = time.monotonic()
+
+        # 1. IMPACTS — always, never budgeted away. In ALERTS mode a wearable
+        #    sends no telemetry at all, so anything gated behind "did we get
+        #    samples?" would never forward a single hit.
+        impacts = self.source.drain_impacts()
+        for event in impacts:
+            self._send_record(protocol.MSG_IMPACT,
+                              protocol.encode_impact_binary(event))
+
+        # 2. Absorb every node's latest sample into summary state. This is
+        #    bounded by roster size, not by traffic — see UdpImuSource._latest.
+        for sample in self.source.drain():
+            node = sample["node"]
+            self._node_rx[node] = self._node_rx.get(node, 0) + 1
+            self._node_seen[node] = now
+
+        # 3. FOCUSED nodes stream at full rate. Only these produce per-sample
+        #    records, and only up to the tick budget — forwarding all 180 nodes
+        #    per sample is ~18,000 records/s, about 90x what bluezero carries.
+        budget = max(0, self._tick_budget - len(impacts))
+        sent = 0
+        for sample in self.source.drain_focus():
+            if sent >= budget:
+                break
             node_idx = self.node_index.get(sample["node"])
             if node_idx is None:
                 continue
             layout = self.layouts[self.node_layout[node_idx]]
-            payload = protocol.encode_sample_binary(
-                sample, node_idx, layout, self.field_specs)
-            message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
-            for chunk in protocol.chunk_bytes(message, self.chunk_size):
-                self.data_char.set_value(list(chunk))
-        if self.verbose:
-            print(f"# sent {len(samples)} live samples "
-                  f"(t_s={samples[-1]['t_s']:.3f})", file=sys.stderr)
+            self._send_record(protocol.MSG_SAMPLE, protocol.encode_sample_binary(
+                sample, node_idx, layout, self.field_specs))
+            sent += 1
+
+        # 4. SQUAD SUMMARY — one batched record covering everybody, ~1 Hz.
+        if now - self._last_summary >= self._summary_period_s:
+            self._send_summary(now)
+            self._last_summary = now
+
+        # 5. Sample monitoring coverage once a second. This is what separates
+        #    "no impacts" from "we could not hear the sensor" in the report.
+        if self.group is not None and now - self._last_cov_tick >= 1.0:
+            self._last_cov_tick = now
+            self.group.tick(self.source)
+
+        # 6. Re-govern the squad's telemetry rate as devices come and go.
+        if self.source is not None and now - self._last_govern >= 30.0:
+            self._last_govern = now
+            if self.roster is not None and self.roster.assigned_wids():
+                self.source.govern()
+            self.source.reset_rate_stats()
+
+        if not impacts and not sent and not self._node_seen:
+            if now - self._last_wait_log >= 5.0:
+                print("# waiting for UDP data from wearables…", file=sys.stderr)
+                self._last_wait_log = now
         return True
+
+    def _send_summary(self, now):
+        """One MSG_SUMMARY record for the whole squad.
+
+        Per-node records would be 180 notifications/second at 1 Hz, which is the
+        entire BLE budget. Batched it is ~13 chunked notifications, and the app
+        gets one consistent snapshot instead of 180 that tear across each other.
+        """
+        if self.roster is None or self.data_char is None:
+            return
+        window = max(now - self._last_summary, 1e-6)
+        by_node = {}
+        if self.impacts is not None:
+            for athlete in self.impacts.athletes():
+                for dev in athlete["devices"]:
+                    by_node[dev["wid"]] = dev
+        modes = self.source.modes() if self.source else {}
+        focused = set(self.source.focus) if self.source else set()
+
+        entries = []
+        for idx, meta in enumerate(self.roster.node_meta()):
+            node, wid = meta["node"], meta["wid"]
+            dev = by_node.get(wid, {})
+            seen = self._node_seen.get(node)
+            age_ms = int((now - seen) * 1000) if seen else 65535
+            flags = 0
+            if meta["is_head"]:
+                flags |= protocol.SUMMARY_FLAG_HEAD
+            if seen and (now - seen) < 5.0:
+                flags |= protocol.SUMMARY_FLAG_LIVE
+            if node in focused:
+                flags |= protocol.SUMMARY_FLAG_FOCUSED
+            impacts = dev.get("impacts", 0)
+            entries.append({
+                "node_idx": idx,
+                "flags": flags,
+                "head_impacts": impacts if meta["is_head"] else 0,
+                "body_impacts": 0 if meta["is_head"] else impacts,
+                "peak_g": dev.get("peak_g", 0.0),
+                "age_ms": age_ms,
+                "rate_hz": round(self._node_rx.get(node, 0) / window),
+                "mode": modes.get(wid) or 0,
+            })
+        self._node_rx.clear()
+        if entries:
+            self._send_record(protocol.MSG_SUMMARY,
+                              protocol.encode_summary_binary(entries))
 
     # -- bring-up ----------------------------------------------------------- #
     def _trigger_desc(self):
@@ -436,6 +781,15 @@ class BleSender:
             srv_id=1, chr_id=5, uuid=protocol.WEARABLES_UUID,
             value=list(self._wearables_cache), notifying=False,
             flags=["read"], read_callback=self.wearables_read)
+        periph.add_characteristic(
+            srv_id=1, chr_id=6, uuid=protocol.IMPACTS_UUID,
+            value=list(self._impacts_cache), notifying=False,
+            flags=["read"], read_callback=self.impacts_read)
+        periph.add_characteristic(
+            srv_id=1, chr_id=7, uuid=protocol.ROSTER_UUID,
+            value=list(self._roster_cache), notifying=False,
+            flags=["read", "write", "reliable-write"],
+            read_callback=self.roster_read, write_callback=self.roster_write)
 
         if self.button_pin is not None:
             self._arm_gpio_button()
@@ -463,7 +817,12 @@ class BleSender:
     # -- presence advertisement --------------------------------------------- #
     def _presence_data(self):
         active = self.source.active_wearables() if self.source else {}
-        return protocol.presence_manufacturer_data(active.keys())
+        athletes_live = len({self.roster.lookup(w)["athlete_id"]
+                             for w in active if self.roster
+                             and self.roster.lookup(w)}) if self.roster else 0
+        return protocol.presence_manufacturer_data(
+            active.keys(), athletes_live,
+            self.roster.revision if self.roster else 0)
 
     @staticmethod
     def _set_mfg_data(advert, mid, data):
@@ -523,6 +882,17 @@ def parse_args(argv=None):
                    help="this Pi's ID for WELCOME/FORGET (default: from config)")
     p.add_argument("--no-ap", action="store_true",
                    help="don't bring up the hidden WiFi AP (live mode)")
+    p.add_argument("--roster", default=None,
+                   help="athlete roster JSON (default: roster.json next to the "
+                        "receiver config). Starts EMPTY; the app assigns "
+                        "wearables to athletes and body positions at runtime")
+    p.add_argument("--impact-log", default=None,
+                   help="JSONL file impacts are appended to (default: "
+                        "impacts.jsonl next to the receiver config)")
+    p.add_argument("--wire-schema", choices=("agg", "raw"), default="agg",
+                   help="telemetry layout published to the app: 'agg' = impact "
+                        "aggregates from current firmware (default), 'raw' = "
+                        "legacy raw-IMU axes")
     p.add_argument("--live-period-ms", type=int, default=100,
                    help="UDP queue drain interval in live mode "
                         "(default: %(default)s ms)")
@@ -567,6 +937,10 @@ def run_stdout_live(source, period_ms: int) -> None:
     """Dry-run for live mode: drain the UDP queue to stdout as NDJSON."""
     try:
         while True:
+            for event in source.drain_impacts():
+                sys.stdout.buffer.write(
+                    (json.dumps({"type": "impact", **event},
+                                separators=(",", ":")) + "\n").encode())
             for sample in source.drain():
                 sys.stdout.buffer.write(protocol.sample_to_ndjson(sample))
             sys.stdout.buffer.flush()
@@ -585,18 +959,62 @@ def main_udp(args) -> None:
     if not args.no_ap:
         wifi_ap.ensure_ap(cfg)
 
-    source = UdpImuSource(cfg["udp_port"], cfg["pi_id"], verbose=args.verbose)
+    # Athlete roster. DEFAULT IS EMPTY: a fresh receiver monitors nobody until
+    # the app assigns wearables. Wearables still associate, handshake, and show
+    # up in the Wearables characteristic's "unassigned" list so they can be
+    # assigned; their impacts are recorded unattributed in the meantime.
+    roster_path = (Path(args.roster).expanduser() if args.roster
+                   else cfg_path.parent / "roster.json")
+    squad = roster_mod.Roster(roster_path).load()
+    if squad.is_empty():
+        legacy = protocol.migrate_legacy_roster(cfg)
+        if legacy:
+            try:
+                squad.apply(legacy)
+                print(f"# roster: migrated {len(legacy['athletes'])} athlete(s) "
+                      f"from receiver_config.json -> {roster_path}",
+                      file=sys.stderr)
+            except roster_mod.RosterError as exc:
+                print(f"# roster: legacy migration failed ({exc})", file=sys.stderr)
+
+    log_path = (Path(args.impact_log).expanduser() if args.impact_log
+                else cfg_path.parent / "impacts.jsonl")
+    impacts = impact_store_mod.ImpactStore(roster=squad, log_path=log_path)
+    print(f"# impact log -> {log_path} (session {impacts.session})",
+          file=sys.stderr)
+    if squad.is_empty():
+        print("# roster is EMPTY — no athlete is being monitored yet. Assign "
+              "wearables from the app (Roster characteristic).", file=sys.stderr)
+    else:
+        print(f"# monitoring {len(squad.athletes())} athlete(s), "
+              f"{len(squad.assigned_wids())} device(s), "
+              f"{len(squad.head_wids())} head sensor(s)", file=sys.stderr)
+
+    group = session_mod.GroupSession(squad, impacts,
+                                     log_dir=cfg_path.parent / "sessions")
+
+    source = UdpImuSource(cfg["udp_port"], cfg["pi_id"], roster=squad,
+                          verbose=args.verbose, impact_store=impacts)
     source.start()
+    if squad.assigned_wids():
+        n = len(squad.assigned_wids())
+        hz = protocol.telemetry_rate_hz(n)
+        print(f"# airtime budget: {n} device(s) -> {hz} Hz each "
+              f"(~{n * hz} pps of {protocol.UDP_PACKET_BUDGET_PPS})",
+              file=sys.stderr)
 
     if args.stdout:
         run_stdout_live(source, args.live_period_ms)
         return
 
-    nodes = source.nodes
-    field_specs, layouts, node_layout = protocol.build_live_protocol_meta(nodes)
+    nodes = squad.nodes()
+    field_specs, layouts, node_layout = protocol.build_live_protocol_meta(
+        nodes, schema=args.wire_schema)
     meta = build_meta("live-udp", [], nodes, args.chunk_size,
                       field_specs, layouts, node_layout,
-                      period_ms=args.live_period_ms)
+                      period_ms=args.live_period_ms,
+                      roster=squad.as_dict(), session=impacts.session,
+                      node_meta=squad.node_meta())
 
     # Advertise the receiver's unique per-Pi name so the app registers it under a
     # distinct serial (the shared "aurmor-rpi" collides on the backend's unique
@@ -607,7 +1025,9 @@ def main_udp(args) -> None:
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,
               source=source, live_period_ms=args.live_period_ms,
-              wifi_creds_bytes=wifi_ap.wifi_creds_json(cfg)).run()
+              wifi_creds_bytes=wifi_ap.wifi_creds_json(cfg),
+              impacts=impacts, pi_id=cfg["pi_id"], roster=squad,
+              group_session=group).run()
 
 
 def main(argv=None):
