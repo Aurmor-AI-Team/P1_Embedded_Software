@@ -39,7 +39,7 @@
 
 static const char *TAG = "ble_prov";
 
-#define DEVICE_NAME_PREFIX "aurmor-esp32-"
+#define DEVICE_NAME_PREFIX "aurmor-mibs-"
 static char s_dev_name[24] = {0};
 
 static ble_provision_cfg_t s_cfg = {};
