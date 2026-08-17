@@ -28,6 +28,40 @@ esp_err_t wifi_udp_forget(void);
 // The callback must only post an event (it runs on the rx task).
 void wifi_udp_set_forget_cb(void (*cb)(void));
 
+// How hard we chase the network when we are not on it.
+//
+// A wearable that has been provisioned retries FOREVER — it must re-join its own
+// AP after a power cycle, and the receiver's AP can reject re-auth for minutes
+// while a stale association ages out. But "forever" also means a board whose
+// receiver is genuinely gone never comes back on Bluetooth, which is the only
+// channel the app has left. So the retry has three gears:
+//
+//   FOREGROUND — the normal provisioned state: reconnect immediately, every
+//                time. BLE is off, so the radio is ours alone.
+//   BACKGROUND — orphaned: we kept the credentials and still want the network
+//                back, but BLE is now advertising so the app can reach us.
+//                Retry occasionally instead of continuously, to keep the shared
+//                2.4 GHz front end mostly free for BLE.
+//   PAUSED     — a phone is streaming from us over BLE right now. Do not touch
+//                the WiFi radio at all until it stops; a live session must not
+//                be degraded by association attempts for a receiver that is not
+//                there.
+//
+// Has no effect once the credentials are erased (wifi_udp_forget).
+typedef enum {
+    WIFI_RADIO_FOREGROUND,
+    WIFI_RADIO_BACKGROUND,
+    WIFI_RADIO_PAUSED,
+} wifi_radio_policy_t;
+
+void wifi_udp_set_radio_policy(wifi_radio_policy_t policy);
+
+// Invoked from the UDP receive task when the link has been dead for
+// WIFI_ORPHAN_TIMEOUT_MS despite holding credentials — i.e. the receiver is
+// gone, not merely slow. Fires once per outage; rearmed when the link recovers.
+// The callback must only post an event (it runs on the rx task).
+void wifi_udp_set_orphan_cb(void (*cb)(void));
+
 // Set the UDP destination (dotted-quad IP + port). Persisted to NVS.
 esp_err_t wifi_udp_set_target(const char *ip, uint16_t port);
 

@@ -1,0 +1,48 @@
+# The BLE receiver. Installed by tools/install.sh — don't hand-write this on the
+# Pi, or the deployment stops being reproducible (which is how a receiver ends up
+# unable to manage its own access point with nobody able to say why).
+#
+#   sudo cp tools/aurmor-receiver.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aurmor-receiver
+[Unit]
+Description=Aurmor receiver — BLE GATT server + hidden WiFi AP for wearables
+# The AP profile is a NetworkManager connection and the GATT server is BlueZ, so
+# neither may be touched before those are up.
+After=NetworkManager.service bluetooth.service network-online.target
+Wants=NetworkManager.service bluetooth.service
+
+[Service]
+Type=simple
+# Without this, systemd block-buffers the process's stdout and startup
+# messages appear minutes late — which reads as "it never happened"
+# and sends you debugging the wrong thing.
+Environment=PYTHONUNBUFFERED=1
+# Runs as root ON PURPOSE. The service owns its access point: it creates the
+# profile, repins it to WPA2-CCMP when something resets it to NetworkManager's
+# WPA3-transition default, and rewrites the password when it drifts from
+# receiver_config.json. Unprivileged, every one of those repairs fails with
+# "Insufficient privileges", ensure_ap logs and carries on, and the receiver
+# looks healthy while no wearable can join.
+#
+# The alternative — a normal user plus the polkit rule install.sh also lays
+# down — works for interactive use but is fragile for a service: polkit treats
+# non-login sessions as inactive, so behaviour varies across distro versions.
+# On a dedicated appliance, root is the honest choice.
+User=root
+
+WorkingDirectory=/opt/aurmor/ble-sender
+ExecStart=/opt/aurmor/venv/bin/python /opt/aurmor/ble-sender/ble_sender.py
+
+# Refuse to start into a broken environment rather than half-working: no AP
+# profile, a mis-secured AP, or a missing identity file all produce the same
+# useless symptom ("the app can't see the wearable") hours later.
+ExecStartPre=/opt/aurmor/venv/bin/python /opt/aurmor/ble-sender/ble_sender.py --selftest
+
+Restart=always
+RestartSec=5
+# A crash loop from a genuinely broken install should be loud, not silent.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

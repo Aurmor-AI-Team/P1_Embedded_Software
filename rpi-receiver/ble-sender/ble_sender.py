@@ -36,6 +36,16 @@ import replay
 import wifi_ap
 from udp_source import UdpImuSource
 
+try:
+    import pairing_agent
+except ImportError:  # pragma: no cover - deployment skew only
+    # The agent stops iOS re-asking to pair on every connection, but a receiver
+    # that lacks it must still stream: it is an annoyance fix, not a dependency.
+    # Guarded because this module arrived after the others, so an install that
+    # updated ble_sender.py without copying pairing_agent.py alongside it would
+    # otherwise crash-loop on startup with nothing but "status=1/FAILURE".
+    pairing_agent = None
+
 
 def resolve_data_dir(args) -> Path:
     if args.data_dir:
@@ -114,8 +124,11 @@ class BleSender:
         # binary-v1 encode tables (mirror what Meta publishes to the app).
         self.field_specs = field_specs
         self.layouts = layouts
+        # Live nodes are discovered as boards check in (see _ensure_node), so keep
+        # the ordered list alongside the index to rebuild Meta when it grows.
+        self.nodes = list(nodes)
         self.node_index = {node: i for i, node in enumerate(nodes)}
-        self.node_layout = node_layout
+        self.node_layout = list(node_layout)
         self.name = name
         self.adapter_addr = adapter_addr
         self.chunk_size = chunk_size
@@ -130,6 +143,7 @@ class BleSender:
         self.button_pin = button_pin
         self.power_button = power_button
         self.use_button = (button_pin is not None) or power_button
+        self.pairing_agent_enabled = True
         self._last_wait_log = 0.0
         self._wearables_cache = b'{"active":[]}'
         self._periph = None
@@ -181,8 +195,16 @@ class BleSender:
         elif cmd == "stop":
             self.stop()
         elif parts and parts[0] == "forget":
+            # A wid is REQUIRED. It used to be optional, and omitting it sent a
+            # broadcast FORGET (wearable_id 0), which every board accepts — so a
+            # single "forget" dropped an entire team off the network mid-session.
+            # Nothing legitimate ever wanted that: the app always names one
+            # board. Refuse rather than guess.
             wid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-            if self.source is not None:
+            if wid is None:
+                print("# control: 'forget' needs a wearable id — ignored",
+                      file=sys.stderr)
+            elif self.source is not None:
                 # Retries sleep between sends — keep them off the GLib/BLE loop.
                 threading.Thread(target=self.source.send_forget, args=(wid,),
                                  daemon=True).start()
@@ -278,6 +300,36 @@ class BleSender:
                   file=sys.stderr)
         return True
 
+    # Safety cap so a flood of distinct (e.g. spoofed) wids can't grow the live
+    # node tables without bound. Far above any real group on one receiver.
+    MAX_LIVE_NODES = 64
+
+    def _ensure_node(self, node: str) -> int | None:
+        """Register a live node the first time its board streams: extend the node
+        tables and re-publish Meta so the app can decode this board's samples.
+        Live mode uses one uniform layout, so a new node just appends layout
+        index 0. Returns the node's index, or None if the cap is hit."""
+        idx = self.node_index.get(node)
+        if idx is not None:
+            return idx
+        if len(self.nodes) >= self.MAX_LIVE_NODES:
+            return None
+        idx = len(self.nodes)
+        self.nodes.append(node)
+        self.node_index[node] = idx
+        self.node_layout.append(0)  # live: every node shares layout 0
+        self.meta_bytes = build_meta(
+            "live-udp", [], self.nodes, self.chunk_size,
+            self.field_specs, self.layouts, self.node_layout,
+            period_ms=self.frame_interval_ms)
+        # Re-send Meta BEFORE the sample that references the new index, so the
+        # app's decoder already knows nodes[idx] when the sample arrives.
+        self._send_meta()
+        if self.verbose:
+            print(f"# registered live node '{node}' (idx {idx}); Meta re-sent",
+                  file=sys.stderr)
+        return idx
+
     def _emit_live(self):
         """Timer tick in live mode: drain the UDP queue and notify each sample."""
         if not self.running or self.data_char is None:
@@ -293,7 +345,9 @@ class BleSender:
         for sample in samples:
             node_idx = self.node_index.get(sample["node"])
             if node_idx is None:
-                continue
+                node_idx = self._ensure_node(sample["node"])
+                if node_idx is None:
+                    continue  # node cap hit — drop rather than grow unbounded
             layout = self.layouts[self.node_layout[node_idx]]
             payload = protocol.encode_sample_binary(
                 sample, node_idx, layout, self.field_specs)
@@ -413,6 +467,21 @@ class BleSender:
             print(f"# could not set adapter name to {self.name!r}: {exc}",
                   file=sys.stderr)
 
+        # BlueZ cannot COMPLETE a pairing without a registered agent, and
+        # neither bluetoothctl (unless left running) nor bluezero provides one.
+        # Without it iOS asks to pair on every single connection, the pairing
+        # fails, nothing is stored, and GATT stalls behind the prompt each
+        # time. Register before publish(): the agent is served by the same GLib
+        # loop publish() starts. Best-effort — see pairing_agent.py.
+        if not self.pairing_agent_enabled:
+            print("# pairing agent disabled (--no-pairing-agent) — iOS will "
+                  "re-ask to pair on every connection", file=sys.stderr)
+        elif pairing_agent is not None:
+            pairing_agent.try_register()
+        else:
+            print("# pairing_agent.py not installed — iOS will ask to pair on "
+                  "every connection", file=sys.stderr)
+
         periph = peripheral.Peripheral(addr, local_name=self.name)
         periph.add_service(srv_id=1, uuid=protocol.SERVICE_UUID, primary=True)
         periph.add_characteristic(
@@ -523,6 +592,15 @@ def parse_args(argv=None):
                    help="this Pi's ID for WELCOME/FORGET (default: from config)")
     p.add_argument("--no-ap", action="store_true",
                    help="don't bring up the hidden WiFi AP (live mode)")
+    p.add_argument("--selftest", action="store_true",
+                   help="check this Pi can actually run the receiver (NM "
+                        "privileges, AP profile/security/password, identity "
+                        "file, Bluetooth, modules) and exit non-zero if not")
+    p.add_argument("--no-pairing-agent", action="store_true",
+                   help="don't register the BlueZ pairing agent. Without the "
+                        "agent iOS re-asks to pair on every connection; with it, "
+                        "the link gets bonded/encrypted. Use this to A/B whether "
+                        "bonding is what breaks a GATT read (see pairing_agent.py)")
     p.add_argument("--live-period-ms", type=int, default=100,
                    help="UDP queue drain interval in live mode "
                         "(default: %(default)s ms)")
@@ -602,16 +680,26 @@ def main_udp(args) -> None:
     # distinct serial (the shared "aurmor-rpi" collides on the backend's unique
     # serial column). --name still overrides for manual runs.
     name = args.name or cfg["receiver_name"]
-    BleSender([], meta, name, args.adapter,
+    sender = BleSender([], meta, name, args.adapter,
               args.chunk_size, args.speed, args.loop, args.verbose,
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,
               source=source, live_period_ms=args.live_period_ms,
-              wifi_creds_bytes=wifi_ap.wifi_creds_json(cfg)).run()
+              wifi_creds_bytes=wifi_ap.wifi_creds_json(cfg))
+    sender.pairing_agent_enabled = not args.no_pairing_agent
+    sender.run()
 
 
 def main(argv=None):
     args = parse_args(argv)
+
+    # Before anything else: a receiver that cannot manage its AP, or whose AP is
+    # mis-secured, fails in ways that all look like "the app can't see the
+    # wearable". Make that answerable in one command.
+    if args.selftest:
+        import selftest
+        raise SystemExit(selftest.run(wifi_ap.DEFAULT_CONFIG_PATH))
+
     if args.speed <= 0:
         raise SystemExit("--speed must be > 0")
 
@@ -655,11 +743,13 @@ def main(argv=None):
         creds = b"{}"
         name = args.name or protocol.DEFAULT_DEVICE_NAME
 
-    BleSender(frames, meta, name, args.adapter,
+    sender = BleSender(frames, meta, name, args.adapter,
               args.chunk_size, args.speed, args.loop, args.verbose,
               nodes, field_specs, layouts, node_layout,
               button_pin=args.button_pin, power_button=args.power_button,
-              pose_seq=pose_seq, wifi_creds_bytes=creds).run()
+              pose_seq=pose_seq, wifi_creds_bytes=creds)
+    sender.pairing_agent_enabled = not args.no_pairing_agent
+    sender.run()
 
 
 if __name__ == "__main__":

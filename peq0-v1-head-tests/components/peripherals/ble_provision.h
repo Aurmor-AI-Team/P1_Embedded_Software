@@ -25,7 +25,7 @@ typedef struct {
 } ble_provision_cfg_t;
 
 // Bring up NimBLE and advertise the provisioning GATT server (as
-// "aurmor-esp32-XXXX", suffix from the MAC). Call on demand (BOOT long-press),
+// "aurmor-mibs-XXXX", suffix from the MAC). Call on demand (BOOT long-press),
 // not at boot. Safe to call again after ble_provision_stop().
 esp_err_t ble_provision_start(const ble_provision_cfg_t *cfg);
 

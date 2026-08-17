@@ -46,6 +46,21 @@ static const char *TAG = "wifi_udp";
 #define LOCAL_UDP_PORT    5006     // wearable binds here; Pi replies here
 #define HELLO_PERIOD_MS   2000     // send a HELLO this often
 #define VERIFY_TIMEOUT_MS 6000     // "verified" if WELCOME seen within this window
+// How long the link may be dead before we call the receiver gone and hand the
+// board back to Bluetooth. Long enough to ride out a Pi reboot, a walk out of
+// range, and the ghost-association retry storm after an ungraceful power-off
+// (~35 association attempts); short enough that a user isn't left waiting.
+#define ORPHAN_TIMEOUT_MS   90000
+// Reconnect interval once orphaned. Sparse on purpose: BLE is advertising by
+// then and the two radios share one front end.
+#define BACKGROUND_RETRY_MS 30000
+
+// Re-provisioning has to wait for the station to actually go idle before the
+// driver will accept a new config; the disconnect that gets it there is async.
+// ~2 s of headroom, well inside the app's 30 s join timeout, and skipped
+// entirely on a board that wasn't already retrying.
+#define SET_CONFIG_RETRIES   20
+#define SET_CONFIG_RETRY_MS  100
 
 #define MSG_VERSION  1
 #define MSG_IMU      1
@@ -104,6 +119,21 @@ static volatile int64_t  s_last_welcome_us = 0;
 static uint32_t      s_hello_nonce     = 0;
 static volatile bool s_has_creds       = false;
 static void (*s_forget_cb)(void)      = NULL;
+static void (*s_orphan_cb)(void)      = NULL;
+
+// Orphan watchdog. s_last_link_ok_us is the last moment we were demonstrably
+// talking to our receiver; the watchdog in the rx task compares against it.
+// Seeded at connect time so a board that has never yet been verified still gets
+// the full grace period instead of tripping instantly.
+static volatile int64_t s_last_link_ok_us = 0;
+static volatile bool    s_orphan_reported = false;   // cb already fired for this outage
+static volatile wifi_radio_policy_t s_policy = WIFI_RADIO_FOREGROUND;
+// True only while wifi_udp_connect() swaps the station config. Gates the
+// disconnect handler so our own teardown can't re-arm a connect mid-swap.
+static volatile bool s_reconfiguring = false;
+// When BACKGROUND, the disconnect handler stops reconnecting inline and the rx
+// task retries on this schedule instead.
+static volatile int64_t s_next_retry_us = 0;
 
 // --- NVS helpers ----------------------------------------------------------
 static void nvs_save_str(const char *key, const char *val)
@@ -138,6 +168,9 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         // Only reconnect to a network we're provisioned for; a "forget" clears
         // s_has_creds first, so this also stops us re-joining after unpair.
         if (!s_has_creds) return;
+        // Our own disconnect, on the way to installing new credentials —
+        // reconnecting here would restart the old config and starve set_config.
+        if (s_reconfiguring) return;
         s_retry++;
         // Keep trying indefinitely — a wearable must auto-rejoin its own AP.
         // In particular, after an ungraceful power-off the receiver's AP can
@@ -145,7 +178,16 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         // (reason 2, "previous auth no longer valid") until it ages the ghost
         // out. Giving up here is what left the board stuck after a power cycle.
         // esp_wifi_connect() re-attempts (~2.4 s each), so this self-throttles.
-        esp_wifi_connect();
+        //
+        // ...but only at FOREGROUND. Once we've been handed back to Bluetooth
+        // the retry moves onto the rx task's slow schedule (BACKGROUND), or
+        // stops entirely while a phone is streaming from us (PAUSED) — see
+        // wifi_radio_policy_t.
+        if (s_policy == WIFI_RADIO_FOREGROUND) {
+            esp_wifi_connect();
+        } else if (s_policy == WIFI_RADIO_BACKGROUND) {
+            s_next_retry_us = esp_timer_get_time() + (int64_t)BACKGROUND_RETRY_MS * 1000;
+        }
         // reason 2 stale-assoc/auth-expire, 201 NO_AP_FOUND (AP down/out of
         // range), 15/204 wrong password, 205 generic. Log the first burst, then
         // occasionally, so a long outage doesn't spam the console.
@@ -158,6 +200,10 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_ip4addr_ntoa(&e->ip_info.ip, s_ip_str, sizeof(s_ip_str));
         s_connected = true;
         s_retry = 0;
+        // Back on the network: rearm the orphan watchdog. Deliberately NOT
+        // clearing s_orphan_reported here — app_ctrl owns that transition, because
+        // coming back only matters once it has decided to leave Bluetooth.
+        s_last_link_ok_us = esp_timer_get_time();
         ESP_LOGI(TAG, "connected, ip=%s", s_ip_str);
     }
 }
@@ -196,6 +242,44 @@ static void handle_welcome(const welcome_packet_t *w)
     ESP_LOGI(TAG, "link verified with pi_id=%lu", (unsigned long)pid);
 }
 
+/**
+ * Decide whether our receiver is still there, and drive the slow reconnect once
+ * we've concluded it isn't.
+ *
+ * "Link OK" means associated AND recently verified — both halves matter. An
+ * associated board whose Pi has died still has an IP and would otherwise look
+ * healthy forever while streaming into a void; conversely a board mid-DHCP is
+ * fine and must not be declared orphaned. Runs on the rx task, ~every 200-500 ms.
+ */
+static void link_watchdog(void)
+{
+    if (!s_has_creds) return;   // unprovisioned: nothing to be orphaned from
+
+    const int64_t now = esp_timer_get_time();
+
+    if (s_connected && wifi_udp_is_verified()) {
+        s_last_link_ok_us = now;
+        return;
+    }
+
+    // BACKGROUND: the disconnect handler no longer reconnects inline, so the
+    // sparse retry happens here.
+    if (s_policy == WIFI_RADIO_BACKGROUND && !s_connected &&
+            s_next_retry_us != 0 && now >= s_next_retry_us) {
+        s_next_retry_us = now + (int64_t)BACKGROUND_RETRY_MS * 1000;
+        ESP_LOGI(TAG, "background reconnect attempt");
+        esp_wifi_connect();
+    }
+
+    if (s_orphan_reported) return;     // already reported this outage
+    if (now - s_last_link_ok_us < (int64_t)ORPHAN_TIMEOUT_MS * 1000) return;
+
+    s_orphan_reported = true;
+    ESP_LOGW(TAG, "no receiver for %d s — handing back to Bluetooth",
+             ORPHAN_TIMEOUT_MS / 1000);
+    if (s_orphan_cb) s_orphan_cb();   // must only post an event
+}
+
 static void udp_rx_task(void *arg)
 {
     struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };  // 500 ms
@@ -205,6 +289,10 @@ static void udp_rx_task(void *arg)
     uint8_t buf[64];
 
     while (true) {
+        // Runs on EVERY pass, including the not-connected one below — being
+        // off the network is precisely the case it exists to catch.
+        link_watchdog();
+
         if (!s_connected || !s_has_target) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
@@ -317,12 +405,50 @@ esp_err_t wifi_udp_connect(const char *ssid, const char *password)
     // broadcast probe responses.
     wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
 
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wc);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "set_config: %d", err); return err; }
+    // Stop the station BEFORE touching its config.
+    //
+    // esp_wifi_set_config() is refused outright while a connect attempt is in
+    // flight — "sta is connecting, cannot set config", ESP_ERR_WIFI_CONN. And
+    // the board that most needs re-provisioning is exactly the one that is
+    // always in that state: a wrong password leaves it retrying forever (the
+    // handler below reconnects on every failure), so every attempt to hand it
+    // new credentials was rejected, this function returned early, and NOTHING
+    // was updated — not the running config, not even NVS. The board then kept
+    // failing on the old password while the app reported a join timeout,
+    // pointing at the network rather than at the write that never landed.
+    //
+    // s_reconfiguring suppresses the auto-reconnect our own disconnect would
+    // otherwise trigger, which would put the station straight back into
+    // "connecting" with the OLD config and re-lose the race.
+    s_reconfiguring = true;
+    esp_wifi_disconnect();
+
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < SET_CONFIG_RETRIES; attempt++) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+        if (err == ESP_OK) break;
+        // The disconnect is asynchronous; give it a moment to land. Costs
+        // nothing on an idle board — the first call succeeds there.
+        vTaskDelay(pdMS_TO_TICKS(SET_CONFIG_RETRY_MS));
+    }
+    s_reconfiguring = false;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set_config: %d (station would not go idle)", err);
+        return err;
+    }
 
     s_retry = 0;
-    esp_wifi_disconnect();
-    err = esp_wifi_connect();
+    // An explicit "join this network" — from provisioning, or from the NVS
+    // restore at boot — always chases it at full speed, whatever gear a previous
+    // outage left us in. Without this, provisioning a board that is currently
+    // orphaned would inherit the 30 s backoff (or PAUSED) and appear to hang.
+    s_policy = WIFI_RADIO_FOREGROUND;
+    // Give a fresh association the full grace period before the watchdog can
+    // call it orphaned — at this point we have never been verified.
+    s_last_link_ok_us = esp_timer_get_time();
+    s_orphan_reported = false;
+    s_next_retry_us   = 0;
+    err = esp_wifi_connect();  // already disconnected above
     if (err != ESP_OK) { ESP_LOGE(TAG, "connect: %d", err); return err; }
 
     nvs_save_str("ssid", ssid);
@@ -357,6 +483,36 @@ esp_err_t wifi_udp_forget(void)
 }
 
 void wifi_udp_set_forget_cb(void (*cb)(void)) { s_forget_cb = cb; }
+void wifi_udp_set_orphan_cb(void (*cb)(void)) { s_orphan_cb = cb; }
+
+void wifi_udp_set_radio_policy(wifi_radio_policy_t policy)
+{
+    if (s_policy == policy) return;
+    s_policy = policy;
+    ESP_LOGI(TAG, "radio policy: %s",
+             policy == WIFI_RADIO_FOREGROUND ? "foreground" :
+             policy == WIFI_RADIO_BACKGROUND ? "background" : "paused");
+
+    switch (policy) {
+    case WIFI_RADIO_FOREGROUND:
+        // Chase the network again, starting now, and give the watchdog a fresh
+        // window so re-entering the provisioned state can't instantly re-trip it.
+        s_next_retry_us   = 0;
+        s_last_link_ok_us = esp_timer_get_time();
+        s_orphan_reported        = false;
+        if (s_has_creds && !s_connected) esp_wifi_connect();
+        break;
+    case WIFI_RADIO_BACKGROUND:
+        // First sparse attempt one interval out; the rx task takes it from here.
+        s_next_retry_us = esp_timer_get_time() + (int64_t)BACKGROUND_RETRY_MS * 1000;
+        break;
+    case WIFI_RADIO_PAUSED:
+        // Stop cold: a BLE session is streaming and must own the front end.
+        s_next_retry_us = 0;
+        esp_wifi_disconnect();
+        break;
+    }
+}
 
 esp_err_t wifi_udp_set_target(const char *ip, uint16_t port)
 {

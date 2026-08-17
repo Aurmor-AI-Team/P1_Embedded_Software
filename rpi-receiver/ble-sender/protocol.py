@@ -32,18 +32,26 @@ SCHEMA_VERSION = 2               # 2 = binary-v1 framing (was 1 = NDJSON)
 # WITHOUT connecting (a connection each poll is what prompted the iOS pairing
 # dialog). Mirrored in aurmor-sports-mobile/features/esp32-provisioning/protocol.ts.
 # 0xFFFF is the Bluetooth-SIG "internal/test" company id. Payload after the
-# company id: [version=1, wid-bitmask] (bit i set => wid i+1 is live).
+# company id: [version=2, count, wid0_lo, wid0_hi, …] — an explicit list of live
+# wids as u16 LE. (v1 was an 8-bit bitmask capped at wids 1–8; MAC-derived wids
+# are 16-bit, so the list form replaces it.)
 PRESENCE_MFG_ID = 0xFFFF
-PRESENCE_VERSION = 1
+PRESENCE_VERSION = 2
+# Cap so the manufacturer data fits a single BLE advertisement (company id +
+# [version, count] + 2 bytes/wid). 10 wids => 24 bytes, within the ~29-byte
+# manufacturer-data budget of a legacy advertisement.
+PRESENCE_MAX_WIDS = 10
 
 
 def presence_manufacturer_data(active_wids) -> list:
-    """Payload bytes ([version, bitmask]) for the presence advertisement."""
-    bitmask = 0
-    for wid in active_wids:
-        if 1 <= wid <= 8:
-            bitmask |= 1 << (wid - 1)
-    return [PRESENCE_VERSION, bitmask & 0xFF]
+    """Payload bytes ([version, count, wid0_lo, wid0_hi, …]) for the presence
+    advertisement — an explicit u16-LE list of live wids."""
+    wids = sorted({int(w) & 0xFFFF for w in active_wids})[:PRESENCE_MAX_WIDS]
+    out = [PRESENCE_VERSION, len(wids)]
+    for wid in wids:
+        out.append(wid & 0xFF)
+        out.append((wid >> 8) & 0xFF)
+    return out
 
 # Constant / redundant columns dropped from each sample to save BLE bytes.
 _DROP_COLUMNS = {"timestamp_iso", "label", "version", "present_mask_hex"}

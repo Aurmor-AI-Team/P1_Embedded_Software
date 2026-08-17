@@ -27,5 +27,5 @@ idf_component_register(
         lwip                   # BSD UDP sockets
         nvs_flash              # persisted provisioning
         esp_timer              # timestamps in the packets
-        
+        mbedtls                # HMAC-SHA256 for the enrolment challenge
 )

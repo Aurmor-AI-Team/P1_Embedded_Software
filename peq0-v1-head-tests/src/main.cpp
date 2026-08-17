@@ -10,6 +10,7 @@
 #include "lsm6dsv.h"
 #include "wifi_udp_tx.h"
 #include "ble_provision.h"
+#include "ble_stream.h"
 #include "mock_playback.h"
 #include "app_ctrl.h"
 
@@ -86,6 +87,10 @@ static void imu_print_task(void *arg)
                 // Pi never sees the two interleaved.
                 if (!mock_playback_is_active()) wifi_udp_send_imu(&s);
             }
+            // Solo sessions read straight off the board over BLE instead of
+            // going through the Pi. No-op unless a client is subscribed, and
+            // internally rate-limited, so it is safe at the full sample rate.
+            if (!mock_playback_is_active()) ble_stream_notify(&s);
             float h_mag = sqrtf(s.hx_g * s.hx_g + s.hy_g * s.hy_g + s.hz_g * s.hz_g);
             if (!window_has_sample || h_mag > window_peak_g) {
                 window_peak_g      = h_mag;

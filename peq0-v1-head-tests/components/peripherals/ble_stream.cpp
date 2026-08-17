@@ -1,0 +1,367 @@
+// ---------------------------------------------------------------------------
+// ble_stream.cpp — binary-v1 IMU stream over BLE, byte-compatible with the Pi.
+//
+// Wire format (mirrors rpi-receiver/ble-sender/protocol.py; the app's decoder
+// lives in aurmor-sports-mobile/features/ble-stream/protocol.ts):
+//
+//   record  = msg_type:u8 | length:u16 LE | payload[length]
+//             then split into <= chunk_size notifications.
+//   MSG_META(3)   payload = the JSON descriptor, UTF-8. Carries the decode
+//                 tables; the app cannot decode a sample before it arrives, so
+//                 it is sent the moment a client subscribes.
+//   MSG_SAMPLE(1) payload = node_idx:u8 | t_ms:u32 | fields in layout order,
+//                 each packed per its (type, scale) from field_specs.
+//
+// We publish the same field set the Pi does for a live wearable
+// (LIVE_IMU_FIELDS + LIVE_BIO_FIELDS): 10 IMU values plus the 4 biometric
+// channels. The bio channels are zero here for exactly the same reason they are
+// zero over UDP — a real head sensor has no biometrics — but they stay in the
+// layout so the app's `deriveLiveStats` sees an identical shape either way.
+// ---------------------------------------------------------------------------
+#include "ble_stream.h"
+
+#include "ble_auth.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_timer.h"
+
+#include "host/ble_hs.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+static const char *TAG = "ble_stream";
+
+// Match the Pi's live cadence (ble_sender.py --live-period-ms default) rather
+// than the IMU's own rate: the app renders ~4 Hz and a faster stream only costs
+// airtime and battery.
+#define STREAM_PERIOD_MS  100
+
+// Safe notification payload after MTU negotiation (notification <= MTU - 3).
+// Same default the Pi uses; clamped to the real MTU at send time.
+#define CHUNK_SIZE        180
+
+#define MSG_SAMPLE  1
+#define MSG_META    3
+
+// 1 = NDJSON, 2 = binary-v1. Must equal protocol.py's SCHEMA_VERSION.
+#define SCHEMA_VERSION  2
+
+static uint16_t s_data_handle = 0;
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static volatile bool s_subscribed = false;
+static int64_t  s_last_send_us = 0;
+static volatile bool s_meta_pending = false;
+static void (*s_subscriber_cb)(bool streaming) = NULL;
+
+// The node label the app sees: the wid as 4 uppercase hex digits, matching the
+// Pi's f"{wid:04X}" and the board's own serial suffix. Attribution therefore
+// works out identically whether a sample arrived via the receiver or directly.
+static char s_node[5] = "0000";
+
+// The descriptor is fixed for a single-node board, so it is built once at reset
+// and reused. ~640 bytes; sized with headroom.
+static char s_meta[832];
+static size_t s_meta_len = 0;
+
+// ---------------------------------------------------------------------------
+// binary-v1 packing
+// ---------------------------------------------------------------------------
+
+static inline size_t put_u8(uint8_t *out, size_t off, uint8_t v)
+{
+    out[off] = v;
+    return off + 1;
+}
+
+static inline size_t put_u16(uint8_t *out, size_t off, uint16_t v)
+{
+    out[off]     = (uint8_t)(v & 0xFF);
+    out[off + 1] = (uint8_t)(v >> 8);
+    return off + 2;
+}
+
+static inline size_t put_u32(uint8_t *out, size_t off, uint32_t v)
+{
+    out[off]     = (uint8_t)(v & 0xFF);
+    out[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+    out[off + 2] = (uint8_t)((v >> 16) & 0xFF);
+    out[off + 3] = (uint8_t)((v >> 24) & 0xFF);
+    return off + 4;
+}
+
+/** Pack a float as int16 at `scale`, clamped — the i16 half of _pack_value(). */
+static inline size_t put_scaled_i16(uint8_t *out, size_t off, float v, float scale)
+{
+    float n = v * scale;
+    n = (n < -32768.0f) ? -32768.0f : (n > 32767.0f) ? 32767.0f : n;
+    int32_t r = (int32_t)(n < 0 ? n - 0.5f : n + 0.5f);   // round-half-away, as Python's round()
+    return put_u16(out, off, (uint16_t)(int16_t)r);
+}
+
+/** Pack a float as uint16 at `scale`, clamped — the u16 half of _pack_value(). */
+static inline size_t put_scaled_u16(uint8_t *out, size_t off, float v, float scale)
+{
+    float n = v * scale;
+    n = (n < 0.0f) ? 0.0f : (n > 65535.0f) ? 65535.0f : n;
+    return put_u16(out, off, (uint16_t)(n + 0.5f));
+}
+
+/** Build the JSON descriptor once. Only the node label varies per board. */
+static void build_meta(void)
+{
+    s_meta_len = (size_t)snprintf(
+        s_meta, sizeof(s_meta),
+        "{\"exercise\":\"live-ble\","
+        "\"period_ms\":%d,"
+        "\"fps\":%.2f,"
+        "\"frames\":0,"
+        "\"nodes\":[\"%s\"],"
+        "\"chunk_size\":%d,"
+        "\"framing\":\"binary-v1\","
+        "\"schema\":%d,"
+        "\"field_specs\":{"
+        "\"ax_g\":[\"i16\",1000],\"ay_g\":[\"i16\",1000],\"az_g\":[\"i16\",1000],"
+        "\"gx_dps\":[\"i16\",10],\"gy_dps\":[\"i16\",10],\"gz_dps\":[\"i16\",10],"
+        "\"hx_g\":[\"i16\",1000],\"hy_g\":[\"i16\",1000],\"hz_g\":[\"i16\",1000],"
+        "\"imu_temp_c\":[\"i16\",100],"
+        "\"ecg_hr_bpm\":[\"u16\",1],\"ppg_spo2_pct\":[\"u16\",100],"
+        "\"resp_rate_bpm\":[\"u16\",1],\"ecg_rmssd_ms\":[\"u16\",1]},"
+        "\"layouts\":[[\"ax_g\",\"ay_g\",\"az_g\","
+        "\"gx_dps\",\"gy_dps\",\"gz_dps\","
+        "\"hx_g\",\"hy_g\",\"hz_g\",\"imu_temp_c\","
+        "\"ecg_hr_bpm\",\"ppg_spo2_pct\",\"resp_rate_bpm\",\"ecg_rmssd_ms\"]],"
+        "\"node_layout\":[0]}",
+        STREAM_PERIOD_MS, 1000.0 / STREAM_PERIOD_MS, s_node, CHUNK_SIZE,
+        SCHEMA_VERSION);
+
+    if (s_meta_len >= sizeof(s_meta)) {
+        // Truncated: the app would fail to parse it and never decode a sample.
+        ESP_LOGE(TAG, "meta descriptor truncated (%u >= %u)",
+                 (unsigned)s_meta_len, (unsigned)sizeof(s_meta));
+        s_meta_len = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sending
+// ---------------------------------------------------------------------------
+
+/** Frame `payload` as a binary-v1 record and notify it in <=chunk_size pieces. */
+static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
+{
+    // Single gate for everything that leaves this module, Meta included — an
+    // unauthenticated peer must not learn the board's node id or field layout
+    // either, and suppressing Meta here is what makes the re-send in
+    // ble_stream_on_auth() the one place that decides it is finally allowed.
+    if (!ble_stream_ready()) return;
+
+    // Notifications must fit the negotiated ATT MTU (minus the 3-byte opcode +
+    // handle). Never assume the 247 we ask for — iOS lands around 185.
+    uint16_t mtu = ble_att_mtu(s_conn_handle);
+    size_t chunk = CHUNK_SIZE;
+    if (mtu > 3 && (size_t)(mtu - 3) < chunk) chunk = (size_t)(mtu - 3);
+
+    uint8_t header[3];
+    header[0] = msg_type;
+    header[1] = (uint8_t)(len & 0xFF);
+    header[2] = (uint8_t)((len >> 8) & 0xFF);
+
+    // The record is header + payload as one byte stream, chunked without regard
+    // for the boundary — the app's BinaryFrameAssembler reassembles by length.
+    uint8_t buf[CHUNK_SIZE];
+    size_t sent = 0;
+    const size_t total = sizeof(header) + len;
+    while (sent < total) {
+        size_t n = total - sent;
+        if (n > chunk) n = chunk;
+        for (size_t i = 0; i < n; i++) {
+            size_t pos = sent + i;
+            buf[i] = pos < sizeof(header) ? header[pos] : payload[pos - sizeof(header)];
+        }
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, n);
+        if (!om) return;   // out of mbufs: drop the rest, the next sample retries
+        if (ble_gatts_notify_custom(s_conn_handle, s_data_handle, om) != 0) return;
+        sent += n;
+    }
+}
+
+static void send_meta(void)
+{
+    if (s_meta_len == 0) return;
+    send_record(MSG_META, (const uint8_t *)s_meta, s_meta_len);
+}
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+void ble_stream_reset(uint16_t wid)
+{
+    s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
+    s_subscribed   = false;
+    s_last_send_us = 0;
+    s_meta_pending = false;
+    snprintf(s_node, sizeof(s_node), "%04X", wid);
+    build_meta();
+}
+
+bool ble_stream_ready(void)
+{
+    // Authentication is re-checked HERE, on every send, rather than latched when
+    // the client subscribed. A client is free to enable notifications before it
+    // answers the challenge — ours does not, but GATT gives no ordering
+    // guarantee and stacks pipeline these — and deciding once at subscribe time
+    // meant such a client got silence forever with nothing to recover it.
+    // Evaluating it live makes the order irrelevant: samples simply start
+    // flowing the moment the connection becomes authenticated.
+    return s_subscribed && s_conn_handle != BLE_HS_CONN_HANDLE_NONE
+           && s_data_handle != 0
+           && ble_auth_conn_allowed(s_conn_handle);
+}
+
+void ble_stream_on_auth(uint16_t conn_handle)
+{
+    if (!s_subscribed || conn_handle != s_conn_handle) return;
+    // Subscribed before authenticating, so the Meta that normally accompanies a
+    // subscribe was suppressed. The app drops every sample it has no decode
+    // tables for, so it has to be re-sent — but NOT from here: this runs inside
+    // the GATT write callback for the auth response, and notifying before that
+    // write has been answered means re-entering the ATT layer. Flag it and let
+    // the next sample carry it, on the task that normally sends.
+    ESP_LOGI(TAG, "authenticated after subscribing — Meta queued");
+    s_meta_pending = true;
+    s_last_send_us = 0;
+}
+
+void ble_stream_set_subscriber_cb(void (*cb)(bool streaming)) { s_subscriber_cb = cb; }
+
+void ble_stream_on_subscribe(uint16_t conn_handle, uint16_t data_handle, bool enabled)
+{
+    const bool was = s_subscribed;
+    s_data_handle = data_handle;
+    s_conn_handle = enabled ? conn_handle : BLE_HS_CONN_HANDLE_NONE;
+    s_subscribed  = enabled;
+    if (was != enabled && s_subscriber_cb) s_subscriber_cb(enabled);
+    if (!enabled) return;
+
+    ESP_LOGI(TAG, "client subscribed; streaming node \"%s\" at %d ms", s_node,
+             STREAM_PERIOD_MS);
+    // Meta first, always: the app holds every sample it can't decode. If this
+    // connection hasn't authenticated yet, send_record() drops it — and
+    // ble_stream_on_auth() re-sends it the moment that changes.
+    s_meta_pending = false;
+    send_meta();
+    s_last_send_us = 0;   // let the next sample through immediately
+}
+
+void ble_stream_on_disconnect(void)
+{
+    const bool was = s_subscribed;
+    s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
+    s_subscribed   = false;
+    s_meta_pending = false;
+    // A dropped link ends the session just as surely as an unsubscribe, and is
+    // the far more common way one ends. Without this the WiFi radio would stay
+    // paused for a phone that walked away.
+    if (was && s_subscriber_cb) s_subscriber_cb(false);
+}
+
+void ble_stream_notify(const lsm6_sample_t *s)
+{
+    // Real sensor path: no biometric channels (same as wifi_udp_send_imu).
+    ble_stream_notify_bio(s, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+void ble_stream_notify_bio(const lsm6_sample_t *s,
+                           float hr, float spo2, float resp, float hrv)
+{
+    if (!s || !ble_stream_ready()) return;
+
+    // Decode tables owed from an authenticate-after-subscribe (ble_stream_on_auth).
+    if (s_meta_pending) {
+        s_meta_pending = false;
+        send_meta();
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_last_send_us != 0 && (now_us - s_last_send_us) < (STREAM_PERIOD_MS * 1000)) {
+        return;
+    }
+    s_last_send_us = now_us;
+
+    // node_idx:u8 | t_ms:u32 | 10 IMU i16 | 4 bio u16  == 33 bytes.
+    uint8_t payload[33];
+    size_t off = 0;
+    off = put_u8(payload, off, 0);                                  // single node
+    off = put_u32(payload, off, (uint32_t)(now_us / 1000));         // t_s * 1000
+
+    off = put_scaled_i16(payload, off, s->ax_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->ay_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->az_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->gx_dps, 10.0f);
+    off = put_scaled_i16(payload, off, s->gy_dps, 10.0f);
+    off = put_scaled_i16(payload, off, s->gz_dps, 10.0f);
+    off = put_scaled_i16(payload, off, s->hx_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->hy_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->hz_g, 1000.0f);
+    off = put_scaled_i16(payload, off, s->temp_c, 100.0f);          // -> imu_temp_c
+
+    // Biometrics: zero from a real sensor, filled by the mock. Scales must
+    // match _LIVE_BIO_SPECS in protocol.py.
+    off = put_scaled_u16(payload, off, hr,   1.0f);     // ecg_hr_bpm
+    off = put_scaled_u16(payload, off, spo2, 100.0f);   // ppg_spo2_pct
+    off = put_scaled_u16(payload, off, resp, 1.0f);     // resp_rate_bpm
+    off = put_scaled_u16(payload, off, hrv,  1.0f);     // ecg_rmssd_ms
+
+    send_record(MSG_SAMPLE, payload, off);
+}
+
+// ---------------------------------------------------------------------------
+// GATT access callbacks (the service table lives in ble_provision.cpp)
+// ---------------------------------------------------------------------------
+
+int ble_stream_data_access(uint16_t conn, uint16_t attr,
+                           struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn; (void)attr; (void)arg;
+    // Notify-only. A read returns an empty value rather than an error so a
+    // generic GATT client poking at it doesn't see a failure.
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) return 0;
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+int ble_stream_meta_access(uint16_t conn, uint16_t attr,
+                           struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn; (void)attr; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+    // Served for parity with the receiver; the app reads the descriptor off the
+    // Data stream instead (it exceeds the 512-byte attribute limit there, and
+    // this one is close enough to it that we don't rely on this path either).
+    if (s_meta_len == 0) return 0;
+    int rc = os_mbuf_append(ctxt->om, s_meta, s_meta_len);
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+int ble_stream_control_access(uint16_t conn, uint16_t attr,
+                              struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn; (void)attr; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+
+    // The receiver's grammar is start|stop|restart|forget [wid]. A wearable
+    // streams whenever a client is subscribed and has nothing to forget over
+    // this link, so we accept and ignore — the point is that the app can speak
+    // to either peer without special-casing.
+    char buf[32] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
+    uint16_t olen = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, buf, len, &olen) == 0) {
+        buf[olen] = '\0';
+        ESP_LOGI(TAG, "control: \"%s\" (ignored)", buf);
+    }
+    return 0;
+}

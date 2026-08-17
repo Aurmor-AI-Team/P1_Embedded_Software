@@ -46,12 +46,23 @@ FORGET = struct.Struct("<BBHI")     # header + pi_id                  (8)
 IMU_SIZE = HDR.size + IMU_BODY.size  # 52
 HELLO_SIZE = HELLO.size              # 8
 
-# Which body node each wearable_id maps to. Only mapped IDs are streamed.
-# The app assigns a wid per ESP32 from the body position picked at pairing
-# (see ESP32_KIND_MAP in the app's esp32-provisioning/protocol.ts) — this table
-# MUST agree with it so multiple boards land on distinct, non-colliding nodes.
+# Legacy fixed body-position map, kept for mock/replay (CSV) which still uses
+# body-position node names. The LIVE source no longer defaults to it: each board
+# streams under its own MAC-derived wid (= its serial suffix), and the node label
+# is that wid as 4-hex-digit, so same-position boards from different people never
+# collide. Pass this map explicitly to keep the old HEAD/WA/WD/WE labels.
 #   1 = HEAD (other)   2 = WA (chest)   3 = WD (left wrist)   4 = WE (right wrist)
 WID_TO_NODE: Dict[int, str] = {1: "HEAD", 2: "WA", 3: "WD", 4: "WE"}
+
+
+def node_for_wid(wid: int, overrides: Optional[Dict[int, str]] = None) -> str:
+    """Body node for a wearable id: an explicit override (mock/legacy body
+    positions) if present, else the wid as 4-hex-digit — which equals the
+    board's serial suffix (aurmor-mibs-XXXX), so the app can attribute the
+    node's samples to a specific device by matching that suffix."""
+    if overrides and wid in overrides:
+        return overrides[wid]
+    return f"{wid:04X}"
 
 # t_ms is the board's monotonic uptime clock. If it jumps back by more than
 # this, the board rebooted and we re-baseline its t_s instead of going negative.
@@ -68,7 +79,9 @@ class UdpImuSource:
                  max_queue: int = 1024, verbose: bool = False):
         self.port = port
         self.pi_id = pi_id
-        self.wid_to_node = dict(WID_TO_NODE if wid_to_node is None else wid_to_node)
+        # Live default: no fixed map — each board uses its MAC-derived hex node.
+        # Mock/replay passes an explicit body-position map.
+        self.wid_to_node = dict(wid_to_node) if wid_to_node is not None else {}
         self.verbose = verbose
 
         self._queue: deque = deque(maxlen=max_queue)
@@ -84,20 +97,25 @@ class UdpImuSource:
         self._dropped = 0
         self._last_drop_log = 0.0
 
+    def _node_for(self, wid: int) -> str:
+        return node_for_wid(wid, self.wid_to_node)
+
     @property
     def nodes(self) -> List[str]:
-        return sorted(set(self.wid_to_node.values()))
+        # Any explicit override nodes, plus a node for every board heard from.
+        seen = {self._node_for(wid) for wid in self._last_seen}
+        return sorted(set(self.wid_to_node.values()) | seen)
 
     def active_wearables(self, max_age_s: float = 10.0) -> Dict[int, str]:
-        """Mapped wearables heard from within ``max_age_s`` (wid -> node).
+        """Wearables heard from within ``max_age_s`` (wid -> node).
 
         Boards HELLO every 2 s whenever they are on the network, so a healthy
         idle wearable never ages out. Served over the Wearables characteristic
         so the app can show presence for BLE-silent (provisioned) boards.
         """
         cutoff = time.monotonic() - max_age_s
-        return {wid: node for wid, node in self.wid_to_node.items()
-                if self._last_seen.get(wid, 0.0) > cutoff}
+        return {wid: self._node_for(wid) for wid, seen in self._last_seen.items()
+                if seen > cutoff}
 
     # -- lifecycle ----------------------------------------------------------- #
     def start(self) -> None:
@@ -192,10 +210,10 @@ class UdpImuSource:
             if msg_type == MSG_IMU and len(data) == IMU_SIZE:
                 self._last_addr[wid] = addr
                 self._last_seen[wid] = time.monotonic()
-                node = self.wid_to_node.get(wid)
-                if node is None:
-                    continue  # unmapped board; handshake still answered above
-                self._enqueue(wid, node, data)
+                # Every board streams — its node is its MAC-derived hex wid (or an
+                # explicit override for mock/replay). No board is dropped now that
+                # identity comes from the wid itself rather than a fixed 4-slot map.
+                self._enqueue(wid, self._node_for(wid), data)
 
     def _enqueue(self, wid: int, node: str, data: bytes) -> None:
         (_seq, t_ms,

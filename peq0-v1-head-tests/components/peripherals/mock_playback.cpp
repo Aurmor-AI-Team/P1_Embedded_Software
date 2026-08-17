@@ -1,9 +1,10 @@
 // ---------------------------------------------------------------------------
 // mock_playback.cpp — replay the embedded HEAD mock CSV over UDP, once.
 //
-// A BOOT short-press (see app_ctrl) starts playback: one 52-byte IMU packet
-// per CSV row at the CSV cadence (HEAD_MOCK_CADENCE_MS), through the same
-// wifi_udp_send_imu() path as the live sensor. After the last row playback
+// A BOOT short-press (see app_ctrl) starts playback: one CSV row at the CSV
+// cadence (HEAD_MOCK_CADENCE_MS), down whichever transport is live — the UDP
+// path to the Pi in WIFI mode, or the direct BLE stream when a phone is
+// subscribed in PAIRING mode (a solo session). After the last row playback
 // stops itself; another press while playing stops it early.
 // ---------------------------------------------------------------------------
 #include "mock_playback.h"
@@ -11,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "ble_stream.h"
 #include "head_mock_data.h"
 #include "lsm6dsv.h"
 #include "wifi_udp_tx.h"
@@ -38,14 +40,20 @@ static void tick_cb(void *arg)
     };
     // The head has no biometrics of its own; the mock carries chest/wrist
     // values so the app's Heart rate / SpO2 / Respiration / HRV tiles fill.
+    // Both sinks are no-ops when their transport isn't up, and the two are
+    // mutually exclusive in practice (BLE is off in WIFI mode).
     wifi_udp_send_imu_bio(&s, r->hr, r->spo2, r->resp, r->hrv);
+    ble_stream_notify_bio(&s, r->hr, r->spo2, r->resp, r->hrv);
 }
 
 esp_err_t mock_playback_start(void)
 {
     if (s_active) return ESP_OK;
-    if (!wifi_udp_is_connected() || !wifi_udp_has_target()) {
-        ESP_LOGW(TAG, "not connected/provisioned — playback refused");
+    // Refuse only when there is nowhere to send: either the Pi (WIFI mode) or a
+    // subscribed phone on the direct BLE stream (PAIRING mode, solo session).
+    const bool udp_up = wifi_udp_is_connected() && wifi_udp_has_target();
+    if (!udp_up && !ble_stream_ready()) {
+        ESP_LOGW(TAG, "no receiver and no BLE subscriber — playback refused");
         return ESP_ERR_INVALID_STATE;
     }
     if (s_timer == NULL) {

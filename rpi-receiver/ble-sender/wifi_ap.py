@@ -75,8 +75,24 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
     """Read the receiver config, creating it with generated secrets + a unique
     per-Pi identity if absent."""
     path = Path(path)
-    if path.exists():
-        cfg = json.loads(path.read_text())
+    existed = path.exists()
+    if existed:
+        try:
+            cfg = json.loads(path.read_text())
+        except (ValueError, UnicodeDecodeError) as exc:
+            # Deliberately fatal. Falling through to `cfg = {}` here would mint a
+            # BRAND NEW identity — new SSID, password and pi_id — silently
+            # orphaning every wearable already provisioned to this receiver and
+            # the receiver's own registration in the app. Losing the file is
+            # recoverable from a backup; regenerating over it is not.
+            raise SystemExit(
+                f"{path} exists but is not valid JSON ({exc}).\n"
+                f"Refusing to generate a new receiver identity over it — that "
+                f"would change this Pi's SSID, password and pi_id, and every "
+                f"wearable provisioned to it would stop connecting.\n"
+                f"Restore it from {path.with_suffix('.json.bak')} or a backup, "
+                f"or delete it deliberately to start a new identity."
+            ) from exc
     else:
         cfg = {}
     changed = False
@@ -104,8 +120,37 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
         cfg["pi_id"] = secrets.randbelow(0xFFFFFFFE) + 1  # nonzero u32
         changed = True
     if changed:
+        # Keep the previous file. The values in here ARE this receiver's
+        # identity, so an accidental overwrite is what turns "the config went
+        # missing" into "every wearable and the app now point at a receiver that
+        # no longer exists" — with the old secrets gone and no way back.
+        if existed:
+            try:
+                path.with_suffix(".json.bak").write_text(path.read_text())
+            except OSError as exc:  # noqa: BLE001 - a backup is a nicety
+                print(f"# could not back up {path}: {exc}", file=sys.stderr)
+
         path.write_text(json.dumps(cfg, indent=2) + "\n")
-        print(f"# wrote receiver config -> {path}", file=sys.stderr)
+        if existed:
+            print(f"# wrote receiver config -> {path}", file=sys.stderr)
+        else:
+            # A fresh identity. Say so unmistakably: anything provisioned
+            # against the previous one is now pointing at an AP that is gone,
+            # and the symptom (associate, then WPA handshake timeout, ESP32
+            # disconnect reason 15) looks nothing like "the config was missing".
+            print(f"# ---------------------------------------------------------\n"
+                  f"# NEW RECEIVER IDENTITY generated ({path} was missing):\n"
+                  f"#   SSID   {cfg['ap_ssid']}\n"
+                  f"#   name   {cfg['receiver_name']}\n"
+                  f"#   pi_id  {cfg['pi_id']}\n"
+                  f"# Wearables provisioned to the PREVIOUS identity can no "
+                  f"longer join, and the app's registered receiver no longer\n"
+                  f"# matches. If this Pi worked before, restore the old config "
+                  f"instead of continuing. If the AP profile still exists with\n"
+                  f"# the old password, delete it so it is rebuilt:\n"
+                  f"#   sudo nmcli connection delete {cfg['ap_con_name']}\n"
+                  f"# ---------------------------------------------------------",
+                  file=sys.stderr)
     return cfg
 
 
@@ -130,15 +175,97 @@ _PRIV_HINT = ("creating/modifying the AP profile needs privileges: run once "
               "polkit rule; see README.md)")
 
 
+def _psk_matches(cfg: dict):
+    """Whether the live profile's PSK is the one in our config.
+
+    True / False / None, where None means "not privileged enough to tell".
+
+    This exists because the SSID is NOT sufficient evidence. It is derived from
+    the Pi's board serial, so it survives a config regeneration unchanged — but
+    ap_password is random and does not. Regenerate receiver_config.json (which
+    happens whenever the file goes missing or unreadable) and you get an AP whose
+    SSID still matches while its key no longer does. Wearables are then handed a
+    password the live AP will not accept: they associate fine and die in the
+    4-way handshake, which shows up as ESP32 disconnect reason 15 after a
+    reason 201, and looks for all the world like a firmware bug.
+
+    Reading it needs privileges (`nmcli -s`), hence the None case.
+    """
+    r = _nmcli(["-s", "-g", "802-11-wireless-security.psk",
+                "connection", "show", cfg["ap_con_name"]])
+    if r.returncode != 0:
+        return None
+    live = r.stdout.strip()
+    if not live:
+        return None          # blank == withheld, not "no password set"
+    return live == cfg["ap_password"]
+
+
+def _security_pinned(con: str) -> bool:
+    """True when the profile pins plain WPA2-CCMP.
+
+    Checked explicitly because it is invisible in every other way: an AP left on
+    NetworkManager's defaults is a WPA2/WPA3 transition AP, and an ESP32 station
+    asks for WIFI_AUTH_WPA2_PSK, so the driver FILTERS THAT AP OUT DURING THE
+    SCAN. The board then reports NO_AP_FOUND (reason 201) and never reaches
+    auth — i.e. an access point that is up, active, correctly named and
+    completely invisible to our own hardware.
+
+    These are not secrets, so this works unprivileged.
+    """
+    r = _nmcli(["-g", "802-11-wireless-security.key-mgmt,"
+                "802-11-wireless-security.proto,"
+                "802-11-wireless-security.pairwise,"
+                "802-11-wireless-security.group,"
+                "802-11-wireless-security.pmf",
+                "connection", "show", con])
+    if r.returncode != 0:
+        return True   # can't tell — don't churn a profile on a failed probe
+    got = [line.strip().lower() for line in r.stdout.splitlines()]
+    while len(got) < 5:
+        got.append("")
+    key_mgmt, proto, pairwise, group, pmf = got[:5]
+    # nmcli renders pmf as "1 (disable)" in some versions and "disable" in others.
+    pmf_ok = "disable" in pmf or pmf.startswith("1")
+    return (key_mgmt == "wpa-psk" and proto == "rsn"
+            and pairwise == "ccmp" and group == "ccmp" and pmf_ok)
+
+
 def _settings_match(cfg: dict) -> bool:
     """True when the existing profile already carries our SSID/AP/hidden/channel
-    settings. Reads no secrets, so it works without privileges (the password
-    came from the same config file, so an SSID match is trusted)."""
+    settings, our WPA2 pinning, AND — where we are allowed to look — our
+    password. A mismatch sends ensure_ap down the reconfigure path, which is the
+    repair."""
     r = _nmcli(["-g", "802-11-wireless.ssid,802-11-wireless.hidden,"
                 "802-11-wireless.mode,802-11-wireless.channel",
                 "connection", "show", cfg["ap_con_name"]])
-    return r.returncode == 0 and r.stdout.splitlines() == [
-        cfg["ap_ssid"], "yes", "ap", str(cfg["ap_channel"])]
+    if r.returncode != 0 or r.stdout.splitlines() != [
+            cfg["ap_ssid"], "yes", "ap", str(cfg["ap_channel"])]:
+        return False
+
+    if not _security_pinned(cfg["ap_con_name"]):
+        print(f"# wifi-ap: '{cfg['ap_con_name']}' is not pinned to plain "
+              f"WPA2-CCMP — ESP32 stations filter a WPA3-transition AP out "
+              f"during the scan and report NO_AP_FOUND. Reconfiguring it.",
+              file=sys.stderr)
+        return False
+
+    psk = _psk_matches(cfg)
+    if psk is False:
+        print(f"# wifi-ap: '{cfg['ap_con_name']}' has a DIFFERENT password than "
+              f"receiver_config.json — wearables would associate and then fail "
+              f"the WPA handshake. Reconfiguring it.", file=sys.stderr)
+        return False
+    if psk is None:
+        print(f"# wifi-ap: cannot read '{cfg['ap_con_name']}' password without "
+              f"privileges, so password drift can't be ruled out. If wearables "
+              f"associate but never get an IP, run:\n"
+              f"#   sudo nmcli -s -g 802-11-wireless-security.psk connection "
+              f"show {cfg['ap_con_name']}\n"
+              f"#   sudo nmcli connection delete {cfg['ap_con_name']}   "
+              f"# then restart this service to rebuild it",
+              file=sys.stderr)
+    return True
 
 
 def _is_active(con: str) -> bool:
