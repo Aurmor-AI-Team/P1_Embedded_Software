@@ -1,0 +1,16 @@
+# Gesture-analysis prototype (IMU + video). Same scientific core as ../ik-model.
+numpy>=1.23
+pandas>=1.5
+scipy>=1.10
+
+# Video path (video_pose.py / run_video_demo.py). MediaPipe has no wheel for
+# Python 3.14 — use a Python 3.11/3.12 venv for the video prototype.
+mediapipe>=0.10
+opencv-python>=4.8
+
+# Production upgrade (not required by the prototype):
+#   tslearn>=0.6        # DTW + soft-DTW + barycenter averaging + KNN-DTW
+#   dtaidistance>=2.3   # fast C-backed DTW for runtime scoring
+# Production pose backends (swap inside video_pose.py only):
+#   ultralytics         # YOLO11-pose (GPU, robust, multi-person)
+#   mmpose / mmcv       # RTMPose (SOTA speed/accuracy)

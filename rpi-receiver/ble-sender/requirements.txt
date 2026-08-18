@@ -1,0 +1,16 @@
+# BLE peripheral / GATT server stack (Raspberry Pi / BlueZ only).
+# bluezero pulls in dbus-python and PyGObject, which build against system
+# libraries — on a Pi install those via apt first (see README.md), e.g.:
+#   sudo apt install python3-dbus python3-gi libdbus-1-dev libgirepository1.0-dev
+bluezero>=0.9.0
+
+# Optional: wired GPIO push-button trigger (--button-pin). On Raspberry Pi OS
+# normally preinstalled; if not: sudo apt install python3-gpiozero python3-lgpio
+gpiozero>=2.0
+
+# Optional: Raspberry Pi 5 onboard power-button trigger (--power-button).
+# Prefer apt: sudo apt install python3-evdev   (user must be in the 'input' group)
+evdev>=1.6
+
+# Note: the --stdout dry-run path imports none of the above (stdlib only),
+# so it runs as-is on macOS for local development.

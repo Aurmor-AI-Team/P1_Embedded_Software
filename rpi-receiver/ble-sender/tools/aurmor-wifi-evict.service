@@ -1,0 +1,21 @@
+# Removes stale ("ghost") WiFi stations from the receiver's AP so a rebooting
+# ESP32 can re-authenticate immediately instead of colliding with its own
+# leftover association. Install:
+#   sudo install -m 755 tools/evict_stale_stations.py /usr/local/bin/
+#   sudo cp tools/aurmor-wifi-evict.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aurmor-wifi-evict.service
+[Unit]
+Description=Aurmor receiver — evict stale WiFi stations (ghost associations)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Adjust AURMOR_AP_IFACE if the AP is not on wlan0.
+Environment=AURMOR_AP_IFACE=wlan0
+ExecStart=/usr/local/bin/evict_stale_stations.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
