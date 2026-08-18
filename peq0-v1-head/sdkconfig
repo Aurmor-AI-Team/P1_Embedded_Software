@@ -689,8 +689,7 @@ CONFIG_APPTRACE_LOCK_ENABLE=y
 #
 # Bluetooth
 #
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y 
+# CONFIG_BT_ENABLED is not set
 
 #
 # Common Options

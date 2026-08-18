@@ -11,8 +11,11 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 
-# Raspberry Pi image (from receiver)
-/peq0-v1-receiver/Raspberry Pi Image
+# Raspberry Pi images. (The old /peq0-v1-receiver/Raspberry Pi Image path went
+# away with that folder; tools/prepare-image.sh strips a system in place, so
+# images are produced by dd and should never land in the repo.)
+*.img
+*.img.gz
 
 # Per-Pi receiver config (generated on first run; holds the AP password)
 rpi-receiver/ble-sender/receiver_config.json
