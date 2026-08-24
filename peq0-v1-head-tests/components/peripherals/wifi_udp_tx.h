@@ -1,7 +1,8 @@
 #pragma once
 
 #include "esp_err.h"
-#include "lsm6dsv.h"   // lsm6_sample_t
+#include "impact_det.h"   // impact_rec_t
+#include "lsm6dsv.h"      // lsm6_sample_t
 #include <stdint.h>
 #include <stddef.h>
 
@@ -92,6 +93,20 @@ esp_err_t wifi_udp_send_imu(const lsm6_sample_t *s);
 // sensor path sends 0 for all four via wifi_udp_send_imu.
 esp_err_t wifi_udp_send_imu_bio(const lsm6_sample_t *s,
                                 float hr, float spo2, float resp, float hrv);
+
+// Send one impact RELIABLY: parked in the pending table, transmitted
+// immediately, and retransmitted every ALERT_RETRY_MS until the Pi acks it.
+// Unlike the IMU path an impact is sparse and individually meaningful, so it
+// must not be a fire-and-forget datagram.
+//
+// Returns ESP_OK once the record is queued (whether or not the first datagram
+// succeeded — the retry sweep covers it), ESP_ERR_INVALID_STATE with no link,
+// and ESP_ERR_NO_MEM when the pending table is full, which is the caller's cue
+// to hold the record in its own backlog rather than lose it.
+esp_err_t wifi_udp_send_alert(const impact_rec_t *r);
+
+// Alerts sent but not yet acknowledged.
+uint8_t wifi_udp_alerts_pending(void);
 
 #ifdef __cplusplus
 }

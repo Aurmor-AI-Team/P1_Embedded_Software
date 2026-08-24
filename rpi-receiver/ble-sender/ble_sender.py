@@ -250,7 +250,17 @@ class BleSender:
         self.frame_idx = 0
         self.running = True
         if self.source is not None:
-            self.source.drain()  # discard backlog accumulated while unsubscribed
+            # Discard the stale SAMPLE backlog accumulated while unsubscribed —
+            # nobody wants to watch minutes of old telemetry replay at catch-up
+            # speed. Impacts are the exception: they are sparse, each one is the
+            # reason this product exists, and the wearable already went to the
+            # trouble of retransmitting them until we acked. Put them back.
+            stale = self.source.drain()
+            held = [s for s in stale if s.get("type") == "impact"]
+            if held:
+                self.source.requeue(held)
+                print(f"# holding {len(held)} impact(s) buffered before subscribe",
+                      file=sys.stderr)
         # Always (re)send Meta first so a fresh subscriber — or a restart/loop —
         # can decode the samples that follow.
         self._send_meta()
@@ -348,10 +358,16 @@ class BleSender:
                 node_idx = self._ensure_node(sample["node"])
                 if node_idx is None:
                     continue  # node cap hit — drop rather than grow unbounded
-            layout = self.layouts[self.node_layout[node_idx]]
-            payload = protocol.encode_sample_binary(
-                sample, node_idx, layout, self.field_specs)
-            message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
+            if sample.get("type") == "impact":
+                # Fixed layout, no Meta lookup — stays decodable for a client
+                # that reconnected and has not re-read Meta yet.
+                payload = protocol.encode_impact_binary(sample, node_idx)
+                message = protocol.frame_record(protocol.MSG_IMPACT, payload)
+            else:
+                layout = self.layouts[self.node_layout[node_idx]]
+                payload = protocol.encode_sample_binary(
+                    sample, node_idx, layout, self.field_specs)
+                message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
             for chunk in protocol.chunk_bytes(message, self.chunk_size):
                 self.data_char.set_value(list(chunk))
         if self.verbose:

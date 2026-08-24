@@ -17,7 +17,8 @@ import protocol
 import udp_source
 import wifi_ap
 from test_binary_protocol import decode_sample, iter_records
-from udp_source import (FORGET, HELLO, IMU_BODY, HDR, MSG_FORGET, MSG_IMU,
+from udp_source import (ALERT, ALERT_ACK, FORGET, HELLO, IMU_BODY, HDR,
+                        MSG_ALERT, MSG_ALERT_ACK, MSG_FORGET, MSG_IMU,
                         MSG_WELCOME, UdpImuSource, VERSION, WELCOME)
 
 
@@ -26,6 +27,13 @@ def make_imu(wid: int, seq: int, t_ms: int, values=None) -> bytes:
     values = values or (0.1, -0.2, -1.0, 1.5, -2.5, 3.5, 0.01, 0.02, -0.99, 25.5,
                         88.0, 97.0, 18.0, 42.0)
     return HDR.pack(MSG_IMU, VERSION, wid) + IMU_BODY.pack(seq, t_ms, *values)
+
+
+def make_alert(wid: int, seq: int, t_ms: int, peak_g: float = 41.23,
+               threshold_g: float = 20.0, sum_g: float = 88.41,
+               max_g: float = 41.23, count: int = 3, dur_ms: int = 18) -> bytes:
+    return ALERT.pack(MSG_ALERT, VERSION, wid, seq, t_ms,
+                      peak_g, threshold_g, sum_g, max_g, count, dur_ms)
 
 
 def wait_for(predicate, timeout_s: float = 2.0):
@@ -136,6 +144,113 @@ def run_source_tests() -> int:
 
     src.stop()
     client.close()
+    return failures
+
+
+def run_alert_tests() -> int:
+    """Impact alerts: acked always, deduped, and on the sample timeline."""
+    failures = 0
+    src = UdpImuSource(port=0, pi_id=42, max_queue=8,
+                       wid_to_node=udp_source.WID_TO_NODE)
+    src.start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.bind(("127.0.0.1", 0))
+    client.settimeout(2.0)
+    dest = ("127.0.0.1", src.port)
+
+    # Struct layouts must match wifi_udp_tx.cpp, which asserts the same sizes.
+    assert ALERT.size == 34, ALERT.size
+    assert ALERT_ACK.size == 8, ALERT_ACK.size
+
+    # A sample first, so the impact has an established timeline to land on.
+    client.sendto(make_imu(1, seq=1, t_ms=10_000), dest)
+    assert wait_for(lambda: len(src._queue) >= 1)
+    src.drain()
+
+    # ALERT -> ACK echoing the seq, plus one queued impact record.
+    client.sendto(make_alert(1, seq=5, t_ms=11_000), dest)
+    data, _ = client.recvfrom(64)
+    mt, ver, wid, seq = ALERT_ACK.unpack(data)
+    assert (mt, ver, wid, seq) == (MSG_ALERT_ACK, VERSION, 1, 5), (mt, ver, wid, seq)
+    assert wait_for(lambda: len(src._queue) >= 1)
+    (impact,) = src.drain()
+    assert impact["type"] == "impact", impact
+    assert impact["node"] == "HEAD", impact
+    assert abs(impact["peak_g"] - 41.23) < 1e-3, impact
+    assert abs(impact["threshold_g"] - 20.0) < 1e-3, impact
+    assert impact["seq"] == 5 and impact["dur_ms"] == 18, impact
+    assert impact["count"] == 3, impact
+    # Same clock as the samples: t_ms 11000 with t0 10000 -> 1.0 s.
+    assert abs(impact["t_s"] - 1.0) < 1e-3, impact
+    print("ALERT -> ACK + queued impact OK")
+
+    # A retransmit (the board never heard our ack) must be acked AGAIN but not
+    # queued twice — otherwise a lost ack inflates the athlete's impact count.
+    client.sendto(make_alert(1, seq=5, t_ms=11_000), dest)
+    data, _ = client.recvfrom(64)
+    assert ALERT_ACK.unpack(data)[3] == 5
+    time.sleep(0.1)
+    assert src.drain() == [], "duplicate alert must not queue a second record"
+    print("duplicate ALERT re-acked but deduped OK")
+
+    # A genuinely new impact still gets through.
+    client.sendto(make_alert(1, seq=6, t_ms=12_000, peak_g=55.5), dest)
+    client.recvfrom(64)
+    assert wait_for(lambda: len(src._queue) >= 1)
+    (impact2,) = src.drain()
+    assert impact2["seq"] == 6 and abs(impact2["peak_g"] - 55.5) < 1e-3, impact2
+    print("subsequent ALERT queued OK")
+
+    # Ordering with the sample stream is preserved (one queue, not two).
+    client.sendto(make_imu(1, seq=2, t_ms=13_000), dest)
+    time.sleep(0.05)
+    client.sendto(make_alert(1, seq=7, t_ms=13_500), dest)
+    client.recvfrom(64)
+    time.sleep(0.05)
+    client.sendto(make_imu(1, seq=3, t_ms=14_000), dest)
+    assert wait_for(lambda: len(src._queue) >= 3)
+    time.sleep(0.05)
+    kinds = [r.get("type", "sample") for r in src.drain()]
+    assert kinds == ["sample", "impact", "sample"], kinds
+    print("alert/sample ordering preserved OK")
+
+    # After a board reboot the impact must land on the REBASED timeline, next to
+    # the samples around it — not back near zero.
+    client.sendto(make_imu(1, seq=0, t_ms=100), dest)      # t_ms jumps back
+    assert wait_for(lambda: len(src._queue) >= 1)
+    time.sleep(0.05)
+    (post_reboot,) = src.drain()
+    client.sendto(make_alert(1, seq=1, t_ms=200), dest)
+    client.recvfrom(64)
+    assert wait_for(lambda: len(src._queue) >= 1)
+    (impact3,) = src.drain()
+    assert impact3["t_s"] >= post_reboot["t_s"], (impact3, post_reboot)
+    print("post-reboot ALERT rebased onto the sample timeline OK")
+
+    src.stop()
+    client.close()
+    return failures
+
+
+def run_impact_requeue_tests() -> int:
+    """A subscriber that discards a stale backlog must keep the impacts."""
+    failures = 0
+    src = UdpImuSource(port=0, pi_id=42, max_queue=16)
+    src._queue.append({"node": "AAAA", "t_s": 1.0, "ax_g": 0.1})
+    src._queue.append({"type": "impact", "node": "AAAA", "t_s": 1.5, "seq": 1,
+                       "peak_g": 30.0})
+    src._queue.append({"node": "AAAA", "t_s": 2.0, "ax_g": 0.2})
+    src._queue.append({"type": "impact", "node": "AAAA", "t_s": 2.5, "seq": 2,
+                       "peak_g": 40.0})
+
+    stale = src.drain()
+    held = [s for s in stale if s.get("type") == "impact"]
+    src.requeue(held)
+
+    kept = src.drain()
+    assert [r["seq"] for r in kept] == [1, 2], kept
+    assert all(r.get("type") == "impact" for r in kept), kept
+    print("impacts survive a subscribe-time backlog discard OK")
     return failures
 
 
@@ -440,6 +555,8 @@ def run_ble_sender_dynamic_meta_tests() -> int:
 
 def main() -> int:
     failures = run_source_tests()
+    failures += run_alert_tests()
+    failures += run_impact_requeue_tests()
     failures += run_dynamic_node_tests()
     failures += run_ble_sender_dynamic_meta_tests()
     failures += run_live_meta_tests()

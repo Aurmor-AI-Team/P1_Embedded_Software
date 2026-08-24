@@ -35,6 +35,7 @@ from typing import Dict, List, Optional
 import protocol
 
 MSG_IMU, MSG_HELLO, MSG_WELCOME, MSG_FORGET = 1, 2, 3, 4
+MSG_ALERT, MSG_ALERT_ACK = 5, 6
 VERSION = 1
 
 HDR = struct.Struct("<BBH")         # msg_type, version, wearable_id  (4)
@@ -42,9 +43,18 @@ IMU_BODY = struct.Struct("<II14f")  # seq, t_ms, 10 IMU + 4 bio floats (64)
 HELLO = struct.Struct("<BBHI")      # header + nonce                  (8)
 WELCOME = struct.Struct("<BBHII")   # header + nonce + pi_id          (12)
 FORGET = struct.Struct("<BBHI")     # header + pi_id                  (8)
+# One head impact: header + seq, t_ms, peak, threshold, sum, max, count, dur.
+ALERT = struct.Struct("<BBHIIffffIH")   # (34)
+ALERT_ACK = struct.Struct("<BBHI")      # header + acked seq          (8)
 
-IMU_SIZE = HDR.size + IMU_BODY.size  # 52
+IMU_SIZE = HDR.size + IMU_BODY.size  # 68
 HELLO_SIZE = HELLO.size              # 8
+
+# These must match alert_packet_t / alert_ack_packet_t in wifi_udp_tx.cpp, which
+# carries the same assertion. A silent layout drift here decodes an impact into
+# garbage rather than failing, so assert it at import.
+assert ALERT.size == 34, f"ALERT layout drifted: {ALERT.size} != 34"
+assert ALERT_ACK.size == 8, f"ALERT_ACK layout drifted: {ALERT_ACK.size} != 8"
 
 # Legacy fixed body-position map, kept for mock/replay (CSV) which still uses
 # body-position node names. The LIVE source no longer defaults to it: each board
@@ -94,6 +104,7 @@ class UdpImuSource:
         self._t0_ms: Dict[int, int] = {}         # wid -> first-seen t_ms
         self._rebase_s: Dict[int, float] = {}    # wid -> offset added after reboots
         self._last_t_s: Dict[int, float] = {}    # wid -> last emitted t_s
+        self._last_alert_seq: Dict[int, int] = {}  # wid -> last impact seq queued
         self._dropped = 0
         self._last_drop_log = 0.0
 
@@ -150,6 +161,15 @@ class UdpImuSource:
                 out.append(self._queue.popleft())
             except IndexError:
                 return out
+
+    def requeue(self, items: List[dict]) -> None:
+        """Put drained records back at the FRONT, preserving their order.
+
+        Used when a subscriber discards a stale sample backlog but must keep the
+        impacts that were mixed into it.
+        """
+        for item in reversed(items):
+            self._queue.appendleft(item)
 
     # -- unpair -------------------------------------------------------------- #
     def send_forget(self, wid: Optional[int] = None,
@@ -214,12 +234,28 @@ class UdpImuSource:
                 # explicit override for mock/replay). No board is dropped now that
                 # identity comes from the wid itself rather than a fixed 4-slot map.
                 self._enqueue(wid, self._node_for(wid), data)
+                continue
 
-    def _enqueue(self, wid: int, node: str, data: bytes) -> None:
-        (_seq, t_ms,
-         ax, ay, az, gx, gy, gz, hx, hy, hz, temp_c,
-         hr, spo2, resp, hrv) = IMU_BODY.unpack_from(data, HDR.size)
+            if msg_type == MSG_ALERT and len(data) == ALERT.size:
+                self._last_addr[wid] = addr
+                self._last_seen[wid] = time.monotonic()
+                seq = ALERT.unpack(data)[3]
+                # ACK FIRST, and ack duplicates too. The board retransmits until
+                # it hears one, so a dropped ack — the common case — otherwise
+                # means it resends the same impact forever.
+                self._sock.sendto(ALERT_ACK.pack(MSG_ALERT_ACK, VERSION, wid, seq), addr)
+                if self._last_alert_seq.get(wid) == seq:
+                    continue        # duplicate: our earlier ack was lost
+                self._last_alert_seq[wid] = seq
+                self._enqueue_impact(wid, self._node_for(wid), data)
 
+    def _t_s_for(self, wid: int, t_ms: int) -> float:
+        """Board uptime -> session timeline, surviving a mid-session reboot.
+
+        Shared by samples and impacts so both land on ONE timeline: an impact
+        rebased differently from the surrounding samples would be replayed at
+        the wrong moment.
+        """
         t0 = self._t0_ms.get(wid)
         if t0 is None or t_ms + _REBOOT_JUMP_MS < t0:
             if t0 is not None:  # board rebooted: keep t_s monotonic
@@ -227,6 +263,38 @@ class UdpImuSource:
             self._t0_ms[wid] = t0 = t_ms
         t_s = round((t_ms - t0) / 1000.0 + self._rebase_s.get(wid, 0.0), 3)
         self._last_t_s[wid] = t_s
+        return t_s
+
+    def _enqueue_impact(self, wid: int, node: str, data: bytes) -> None:
+        (_type, _ver, _wid, seq, t_ms,
+         peak_g, threshold_g, sum_g, max_g, count, dur_ms) = ALERT.unpack(data)
+
+        # Impacts are never dropped for queue pressure the way samples are.
+        # There are at most a handful per session and each one is the reason
+        # this product exists; a full queue means the phone is behind, not that
+        # this record is disposable.
+        self._queue.append({
+            "type": "impact",
+            "node": node,
+            "t_s": self._t_s_for(wid, t_ms),
+            "seq": seq,
+            "peak_g": round(peak_g, 3),
+            "threshold_g": round(threshold_g, 3),
+            "dur_ms": dur_ms,
+            # Board-side running totals since ITS boot — loss detection only.
+            "count": count,
+            "max_g": round(max_g, 3),
+            "sum_g": round(sum_g, 3),
+        })
+        print(f"# [{node}] IMPACT #{seq} {peak_g:.1f}g (>{threshold_g:.0f}g) "
+              f"dur={dur_ms}ms board_count={count}", file=sys.stderr)
+
+    def _enqueue(self, wid: int, node: str, data: bytes) -> None:
+        (_seq, t_ms,
+         ax, ay, az, gx, gy, gz, hx, hy, hz, temp_c,
+         hr, spo2, resp, hrv) = IMU_BODY.unpack_from(data, HDR.size)
+
+        t_s = self._t_s_for(wid, t_ms)
 
         if len(self._queue) == self._queue.maxlen:
             self._dropped += 1

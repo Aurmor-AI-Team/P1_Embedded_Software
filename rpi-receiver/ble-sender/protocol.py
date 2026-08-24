@@ -134,6 +134,13 @@ def chunk_bytes(data: bytes, size: int) -> Iterator[bytes]:
 MSG_SAMPLE = 1
 MSG_POSE = 2
 MSG_META = 3
+MSG_IMPACT = 4      # one discrete head impact (see encode_impact_binary)
+
+# Impact detection threshold, in g. The wearable owns this constant
+# (impact_det.h IMPACT_THRESHOLD_G) and puts it on every record; this copy is a
+# default for anything that has to render before the first impact arrives.
+IMPACT_THRESHOLD_G = 20.0
+IMPACT_G_SCALE = 100        # u16/u32 hundredths of a g
 
 POSE_TRAN_SCALE = 1000      # i16: +/-32.767 m
 POSE_QUAT_SCALE = 10000     # i16: +/-3.2767 (quaternion components live in [-1,1])
@@ -197,6 +204,37 @@ def encode_sample_binary(sample: Dict[str, object], node_idx: int,
         typ, scale = field_specs[field]
         parts.append(_pack_value(typ, scale, sample.get(field)))
     return b"".join(parts)
+
+
+def encode_impact_binary(impact: Dict[str, object], node_idx: int) -> bytes:
+    """Pack one impact as a MSG_IMPACT payload (no framing/chunking).
+
+    21 bytes, byte-identical to what ble_stream.cpp emits when a phone reads
+    straight off a wearable:
+
+        node_idx:u8 | seq:u16 | t_ms:u32 | peak_g:u16/100 | threshold_g:u16/100
+        | dur_ms:u16 | count:u16 | max_g:u16/100 | sum_g:u32/100
+
+    The layout is FIXED and deliberately absent from FIELD_SPECS. Impacts are
+    sparse and individually meaningful, so one must stay decodable by a client
+    that reconnected and has not re-read Meta yet — and keeping it out of the
+    live layout is what lets the pinned Meta/sample fixtures stay unchanged.
+
+    ``count``/``max_g``/``sum_g`` are the wearable's own running totals since
+    ITS boot, not since the session. They are carried for loss detection only:
+    a receiver can tell "3 impacts happened" from "3 impacts arrived".
+    """
+    return b"".join([
+        bytes([node_idx & 0xFF]),
+        _pack_value("u16", 1, impact.get("seq", 0)),
+        _pack_value("u32", 1, impact.get("t_ms", 0)),
+        _pack_value("u16", IMPACT_G_SCALE, impact.get("peak_g", 0.0)),
+        _pack_value("u16", IMPACT_G_SCALE, impact.get("threshold_g", IMPACT_THRESHOLD_G)),
+        _pack_value("u16", 1, impact.get("dur_ms", 0)),
+        _pack_value("u16", 1, impact.get("count", 0)),
+        _pack_value("u16", IMPACT_G_SCALE, impact.get("max_g", 0.0)),
+        _pack_value("u32", IMPACT_G_SCALE, impact.get("sum_g", 0.0)),
+    ])
 
 
 def encode_pose_binary(t_s: float, tran, quats) -> bytes:

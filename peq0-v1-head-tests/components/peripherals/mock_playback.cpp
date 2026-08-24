@@ -1,18 +1,26 @@
 // ---------------------------------------------------------------------------
 // mock_playback.cpp — replay the embedded HEAD mock CSV over UDP, once.
 //
-// A BOOT short-press (see app_ctrl) starts playback: one CSV row at the CSV
-// cadence (HEAD_MOCK_CADENCE_MS), down whichever transport is live — the UDP
-// path to the Pi in WIFI mode, or the direct BLE stream when a phone is
-// subscribed in PAIRING mode (a solo session). After the last row playback
-// stops itself; another press while playing stops it early.
+// A BOOT short-press (see app_ctrl) starts playback: one CSV row at a time,
+// down whichever transport is live — the UDP path to the Pi in WIFI mode, or
+// the direct BLE stream when a phone is subscribed in PAIRING mode (a solo
+// session). After the last row playback stops itself; another press while
+// playing stops it early.
+//
+// Timing is PER ROW (head_mock_row_t.dt_ms), not one periodic tick. The capture
+// is sampled every 255 ms, but the synthetic head impacts spliced into it are
+// 16 ms half-sine pulses sampled every 2 ms — an impact squeezed into a single
+// 255 ms row would claim a contact 16x longer than any real one.
 // ---------------------------------------------------------------------------
 #include "mock_playback.h"
+
+#include <math.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
 
 #include "ble_stream.h"
+#include "impact_det.h"
 #include "head_mock_data.h"
 #include "lsm6dsv.h"
 #include "wifi_udp_tx.h"
@@ -38,12 +46,30 @@ static void tick_cb(void *arg)
         .gx_dps = r->gx_dps, .gy_dps = r->gy_dps, .gz_dps = r->gz_dps,
         .temp_c = r->imu_temp_c,
     };
+
+#ifdef IMPACT_TEST_HOOK
+    // Demo only. The live IMU path (main.cpp) is the ONLY producer in a
+    // production build, so fabricated rows can never be recorded as a real
+    // athlete's head impacts — which is exactly what an impact record must
+    // never be wrong about.
+    {
+        float h_mag = sqrtf(s.hx_g * s.hx_g + s.hy_g * s.hy_g + s.hz_g * s.hz_g);
+        impact_det_feed(&s, h_mag);
+        impact_det_service();
+    }
+#endif
+
     // The head has no biometrics of its own; the mock carries chest/wrist
     // values so the app's Heart rate / SpO2 / Respiration / HRV tiles fill.
     // Both sinks are no-ops when their transport isn't up, and the two are
     // mutually exclusive in practice (BLE is off in WIFI mode).
     wifi_udp_send_imu_bio(&s, r->hr, r->spo2, r->resp, r->hrv);
     ble_stream_notify_bio(&s, r->hr, r->spo2, r->resp, r->hrv);
+
+    // Schedule the next row at ITS own interval.
+    if (s_active) {
+        esp_timer_start_once(s_timer, (uint64_t)(r->dt_ms ? r->dt_ms : 1) * 1000);
+    }
 }
 
 esp_err_t mock_playback_start(void)
@@ -69,12 +95,13 @@ esp_err_t mock_playback_start(void)
     }
     s_row = 0;
     s_active = true;
-    esp_err_t err = esp_timer_start_periodic(s_timer,
-                                             (uint64_t)HEAD_MOCK_CADENCE_MS * 1000);
+    // One-shot, re-armed per row: rows do not share a cadence any more.
+    esp_err_t err = esp_timer_start_once(s_timer, 1000);
     if (err != ESP_OK) { s_active = false; return err; }
-    ESP_LOGI(TAG, "playing %d rows @ %d ms (~%d s, once)",
-             HEAD_MOCK_ROWS, HEAD_MOCK_CADENCE_MS,
-             HEAD_MOCK_ROWS * HEAD_MOCK_CADENCE_MS / 1000);
+    uint32_t total_ms = 0;
+    for (int i = 0; i < HEAD_MOCK_ROWS; i++) total_ms += HEAD_MOCK_DATA[i].dt_ms;
+    ESP_LOGI(TAG, "playing %d rows (~%lu s, once)",
+             HEAD_MOCK_ROWS, (unsigned long)(total_ms / 1000));
     return ESP_OK;
 }
 

@@ -1,7 +1,8 @@
 #pragma once
 
 #include "esp_err.h"
-#include "lsm6dsv.h"   // lsm6_sample_t
+#include "impact_det.h"   // impact_rec_t
+#include "lsm6dsv.h"      // lsm6_sample_t
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -88,6 +89,15 @@ void ble_stream_set_subscriber_cb(void (*cb)(bool streaming));
 void ble_stream_notify(const lsm6_sample_t *s);
 void ble_stream_notify_bio(const lsm6_sample_t *s,
                            float hr, float spo2, float resp, float hrv);
+
+// Send one detected impact as a MSG_IMPACT record. Unlike the sample path this
+// is NOT rate-limited — an impact goes out the moment it is detected — and it
+// carries its own fixed field layout, so it stays decodable by a client that
+// has not (re-)read Meta.
+//
+// Returns ESP_ERR_INVALID_STATE when no authenticated subscriber is listening,
+// which is the caller's cue to try the other transport or buffer the record.
+esp_err_t ble_stream_send_impact(const impact_rec_t *r);
 
 #ifdef __cplusplus
 }

@@ -21,12 +21,17 @@
 #include "ble_stream.h"
 
 #include "ble_auth.h"
+#include "impact_det.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "host/ble_hs.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -44,6 +49,18 @@ static const char *TAG = "ble_stream";
 
 #define MSG_SAMPLE  1
 #define MSG_META    3
+// One discrete head impact. Fixed 21-byte layout, deliberately NOT described in
+// the Meta field_specs: an impact must stay decodable by a client that
+// reconnected and has not re-read Meta yet, and keeping it out of the layout is
+// what lets the pinned Meta/sample fixtures stay byte-identical.
+#define MSG_IMPACT  4
+#define IMPACT_PAYLOAD_LEN 21
+
+// Application-error ATT code for "refused". Mirrors the definition and the long
+// rationale in ble_provision.cpp — never BLE_ATT_ERR_INSUFFICIENT_AUTHEN, which
+// makes the central try to bond against a server with no security manager and
+// drops the link.
+#define ATT_ERR_NOT_AUTHORIZED 0x80
 
 // 1 = NDJSON, 2 = binary-v1. Must equal protocol.py's SCHEMA_VERSION.
 #define SCHEMA_VERSION  2
@@ -54,6 +71,13 @@ static volatile bool s_subscribed = false;
 static int64_t  s_last_send_us = 0;
 static volatile bool s_meta_pending = false;
 static void (*s_subscriber_cb)(bool streaming) = NULL;
+
+// send_record() is called from TWO tasks: the NimBLE host task (Meta, on
+// subscribe) and the IMU task (samples and impacts). It emits one record as N
+// chunked notifications, so two interleaved calls splice their chunks together
+// and permanently desync the app's BinaryFrameAssembler — it reads a length,
+// then consumes the wrong bytes for it. Serialise the whole record.
+static SemaphoreHandle_t s_tx_lock = NULL;
 
 // The node label the app sees: the wid as 4 uppercase hex digits, matching the
 // Pi's f"{wid:04X}" and the board's own serial suffix. Attribution therefore
@@ -106,6 +130,15 @@ static inline size_t put_scaled_u16(uint8_t *out, size_t off, float v, float sca
     float n = v * scale;
     n = (n < 0.0f) ? 0.0f : (n > 65535.0f) ? 65535.0f : n;
     return put_u16(out, off, (uint16_t)(n + 0.5f));
+}
+
+/** Pack a float as uint32 at `scale`, clamped. Double maths: a float cannot
+ *  represent the top of the u32 range to 0.01 g, which is what sum_g needs. */
+static inline size_t put_scaled_u32(uint8_t *out, size_t off, float v, float scale)
+{
+    double n = (double)v * (double)scale;
+    n = (n < 0.0) ? 0.0 : (n > 4294967295.0) ? 4294967295.0 : n;
+    return put_u32(out, off, (uint32_t)(n + 0.5));
 }
 
 /** Build the JSON descriptor once. Only the node label varies per board. */
@@ -168,6 +201,15 @@ static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
     header[1] = (uint8_t)(len & 0xFF);
     header[2] = (uint8_t)((len >> 8) & 0xFF);
 
+    // Hold the lock across the WHOLE record — see s_tx_lock. Short timeout and
+    // drop rather than block: this runs on the IMU task, which must not stall
+    // behind a busy host task (a stalled IMU task overruns the sample queue and
+    // can lose an impact's true peak).
+    if (s_tx_lock && xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "tx busy — dropped a type-%u record", (unsigned)msg_type);
+        return;
+    }
+
     // The record is header + payload as one byte stream, chunked without regard
     // for the boundary — the app's BinaryFrameAssembler reassembles by length.
     uint8_t buf[CHUNK_SIZE];
@@ -181,10 +223,22 @@ static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
             buf[i] = pos < sizeof(header) ? header[pos] : payload[pos - sizeof(header)];
         }
         struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, n);
-        if (!om) return;   // out of mbufs: drop the rest, the next sample retries
-        if (ble_gatts_notify_custom(s_conn_handle, s_data_handle, om) != 0) return;
+        // Bailing out mid-record leaves a TRUNCATED record on the wire, and the
+        // assembler then mis-frames everything after it. We cannot un-send what
+        // already went, so the recovery is to make the app resynchronise: it
+        // discards bytes until a record parses, and a fresh Meta re-anchors it.
+        if (!om || ble_gatts_notify_custom(s_conn_handle, s_data_handle, om) != 0) {
+            if (sent > 0) {
+                ESP_LOGE(TAG, "truncated type-%u record at %u/%u — queueing Meta resync",
+                         (unsigned)msg_type, (unsigned)sent, (unsigned)total);
+                s_meta_pending = true;
+            }
+            break;
+        }
         sent += n;
     }
+
+    if (s_tx_lock) xSemaphoreGive(s_tx_lock);
 }
 
 static void send_meta(void)
@@ -199,6 +253,7 @@ static void send_meta(void)
 
 void ble_stream_reset(uint16_t wid)
 {
+    if (!s_tx_lock) s_tx_lock = xSemaphoreCreateMutex();
     s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
     s_subscribed   = false;
     s_last_send_us = 0;
@@ -318,6 +373,38 @@ void ble_stream_notify_bio(const lsm6_sample_t *s,
     send_record(MSG_SAMPLE, payload, off);
 }
 
+esp_err_t ble_stream_send_impact(const impact_rec_t *r)
+{
+    if (!r || !ble_stream_ready()) return ESP_ERR_INVALID_STATE;
+
+    // Same debt the sample path settles: an impact that arrives before the
+    // decode tables is undecodable and the app drops it on the floor.
+    if (s_meta_pending) {
+        s_meta_pending = false;
+        send_meta();
+    }
+
+    // node_idx:u8 | seq:u16 | t_ms:u32 | peak,thresh:u16 | dur:u16 |
+    // count:u16 | max:u16 | sum:u32  == 21 bytes.
+    uint8_t payload[IMPACT_PAYLOAD_LEN];
+    size_t off = 0;
+    off = put_u8(payload, off, 0);                                   // single node
+    off = put_u16(payload, off, (uint16_t)(r->seq & 0xFFFF));
+    off = put_u32(payload, off, r->t_ms);
+    off = put_scaled_u16(payload, off, r->peak_g, 100.0f);
+    off = put_scaled_u16(payload, off, r->threshold_g, 100.0f);
+    off = put_u16(payload, off, r->dur_ms);
+    off = put_u16(payload, off, (uint16_t)(r->count > 65535 ? 65535 : r->count));
+    off = put_scaled_u16(payload, off, r->max_g, 100.0f);
+    off = put_scaled_u32(payload, off, r->sum_g, 100.0f);
+
+    // Deliberately does NOT touch s_last_send_us: the STREAM_PERIOD_MS limiter
+    // lives in notify_bio, not in send_record, so an impact goes out the moment
+    // it is detected without stalling or being stalled by the sample cadence.
+    send_record(MSG_IMPACT, payload, off);
+    return ESP_OK;
+}
+
 // ---------------------------------------------------------------------------
 // GATT access callbacks (the service table lives in ble_provision.cpp)
 // ---------------------------------------------------------------------------
@@ -359,9 +446,28 @@ int ble_stream_control_access(uint16_t conn, uint16_t attr,
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
     uint16_t olen = 0;
-    if (ble_hs_mbuf_to_flat(ctxt->om, buf, len, &olen) == 0) {
-        buf[olen] = '\0';
-        ESP_LOGI(TAG, "control: \"%s\" (ignored)", buf);
+    if (ble_hs_mbuf_to_flat(ctxt->om, buf, len, &olen) != 0) return 0;
+    buf[olen] = '\0';
+
+#ifdef IMPACT_TEST_HOOK
+    // Bring-up only. The mock CSV peaks near 1 g on the high-g channel, so
+    // there is otherwise no way to see the impact pipeline work without hitting
+    // real hardware. Unlike the rest of this grammar it has an effect, so it is
+    // the one control word that needs the auth gate.
+    if (strncmp(buf, "impact-test", 11) == 0) {
+        // NOT BLE_ATT_ERR_INSUFFICIENT_AUTHEN — that tells the central to start
+        // bonding, which this server cannot do, and the phone drops the link.
+        if (!ble_auth_conn_allowed(conn)) return ATT_ERR_NOT_AUTHORIZED;
+        float g = (float)atof(buf + 11);        // "impact-test 35" -> 35 g
+        if (g < IMPACT_THRESHOLD_G) g = 35.0f;  // bare "impact-test"
+        impact_det_inject(g);
+        return 0;
     }
+#endif
+
+    // The receiver's grammar is start|stop|restart|forget [wid]. A wearable
+    // streams whenever a client is subscribed and has nothing to forget over
+    // this link, so we accept and ignore.
+    ESP_LOGI(TAG, "control: \"%s\" (ignored)", buf);
     return 0;
 }
