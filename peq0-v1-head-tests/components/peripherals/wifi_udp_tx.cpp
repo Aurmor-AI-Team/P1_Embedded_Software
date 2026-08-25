@@ -8,7 +8,8 @@
 // Credentials, target, wearable ID, and expected Pi ID persist in NVS.
 //
 // All messages share a 4-byte header:
-//   uint8  msg_type   (1=IMU, 2=HELLO, 3=WELCOME, 4=FORGET)
+//   uint8  msg_type   (1=IMU, 2=HELLO, 3=WELCOME, 4=FORGET, 5=ALERT,
+//                      6=ALERT_ACK, 7=MODE, 8=MODE_RPT)
 //   uint8  version    (MSG_VERSION)
 //   uint16 wearable_id
 //
@@ -22,6 +23,17 @@
 //   "unpair": erase stored credentials and drop off the WiFi. Accepted only
 //   when the wearable_id targets us (or is 0) and pi_id matches the last
 //   WELCOME (or we have not verified a Pi yet).
+// MODE (9 bytes, Pi->wearable)    = header + uint32 pi_id + uint8 mode
+//   The working mode the app picked (wearable_mode_t), relayed by the receiver
+//   because a board on WiFi has its BLE off and cannot be written to directly.
+//   Same acceptance rules as FORGET. The solo-session equivalent is the
+//   "mode <name>" write on the stream service's Control characteristic.
+// MODE_RPT (5 bytes, wearable->Pi)= header + uint8 mode
+//   What we are ACTUALLY in, sent alongside every HELLO — the Pi cannot infer
+//   it, since we reboot into idle and the BOOT button can start a demo.
+//
+// This file must stay in sync with rpi-receiver/ble-sender/udp_source.py, which
+// carries the same structs and the same assertions.
 // ---------------------------------------------------------------------------
 #include "wifi_udp_tx.h"
 
@@ -73,6 +85,8 @@ static const char *TAG = "wifi_udp";
 #define MSG_FORGET   4
 #define MSG_ALERT      5   // wearable -> Pi, one head impact. Acked.
 #define MSG_ALERT_ACK  6   // Pi -> wearable, echoes the alert seq
+#define MSG_MODE       7   // Pi -> wearable, set the working mode (app_ctrl.h)
+#define MSG_MODE_RPT   8   // wearable -> Pi, the mode we are actually in
 
 // Impacts are sparse and individually meaningful, so unlike IMU samples they
 // are retransmitted until acknowledged. The Pi MUST ack every alert — including
@@ -137,8 +151,34 @@ typedef struct __attribute__((packed)) {
     uint32_t seq;          // echoes the alert being acknowledged
 } alert_ack_packet_t;
 
+// 9 bytes — the working mode the app picked, relayed by the receiver to a board
+// it cannot reach over BLE (a group session: the board is on WiFi with its BLE
+// off). The solo equivalent is the "mode <name>" write on the stream service's
+// Control characteristic; both end up in app_ctrl as the same enum.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint32_t pi_id;
+    uint8_t  mode;         // wearable_mode_t
+} mode_packet_t;
+
+// 5 bytes — the mode we are ACTUALLY in, sent alongside every HELLO. The Pi
+// cannot infer this: a board reboots into IDLE, and the BOOT button can start a
+// demo without the app's involvement.
+//
+// This is a separate message rather than a field appended to HELLO on purpose.
+// udp_source.py matches HELLO on an EXACT length, so growing that packet would
+// make an un-upgraded receiver silently drop the handshake and the board would
+// never verify. An unknown msg_type, by contrast, falls through both sides'
+// dispatch harmlessly — so a new board works against an old Pi and vice versa.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint8_t  mode;         // wearable_mode_t
+} mode_report_packet_t;
+
 _Static_assert(sizeof(alert_packet_t) == 34, "alert_packet_t must match udp_source.py ALERT");
 _Static_assert(sizeof(alert_ack_packet_t) == 8, "alert_ack_packet_t must match udp_source.py ALERT_ACK");
+_Static_assert(sizeof(mode_packet_t) == 9, "mode_packet_t must match udp_source.py MODE");
+_Static_assert(sizeof(mode_report_packet_t) == 5, "mode_report_packet_t must match udp_source.py MODE_RPT");
 
 static volatile bool s_connected = false;
 static char          s_ip_str[16] = "0.0.0.0";
@@ -168,6 +208,10 @@ static uint32_t      s_hello_nonce     = 0;
 static volatile bool s_has_creds       = false;
 static void (*s_forget_cb)(void)      = NULL;
 static void (*s_orphan_cb)(void)      = NULL;
+static void (*s_mode_cb)(uint8_t)     = NULL;
+// The working mode, mirrored here purely so send_hello() can report it. app_ctrl
+// owns it; this copy is write-only from our side.
+static volatile uint8_t s_wmode = 0;   // WMODE_IDLE
 
 // Orphan watchdog. s_last_link_ok_us is the last moment we were demonstrably
 // talking to our receiver; the watchdog in the rx task compares against it.
@@ -273,6 +317,15 @@ static void send_hello(void)
         .nonce = s_hello_nonce,
     };
     sendto(s_sock, &h, sizeof(h), 0, (struct sockaddr *)&dest, sizeof(dest));
+
+    // Piggyback the working mode on the same 2 s cadence. A board in ALERTS
+    // sends no telemetry for minutes at a time, so this is the receiver's only
+    // window into what it is doing.
+    mode_report_packet_t m = {
+        .hdr  = { MSG_MODE_RPT, MSG_VERSION, s_wearable_id },
+        .mode = s_wmode,
+    };
+    sendto(s_sock, &m, sizeof(m), 0, (struct sockaddr *)&dest, sizeof(dest));
 }
 
 static void handle_welcome(const welcome_packet_t *w)
@@ -503,6 +556,19 @@ static void udp_rx_task(void *arg)
                          (unsigned long)f->pi_id);
                 if (s_forget_cb) s_forget_cb();   // must only post an event
             }
+        } else if (h->msg_type == MSG_MODE && n >= (int)sizeof(mode_packet_t)) {
+            // The app picked a working mode and the receiver relayed it. Same
+            // acceptance rules as FORGET: a stranger on the network must not be
+            // able to silence someone else's board.
+            mode_packet_t *m = (mode_packet_t *)buf;
+            bool wid_ok = (m->hdr.wearable_id == 0 ||
+                           m->hdr.wearable_id == s_wearable_id);
+            bool pi_ok  = (s_pi_id == 0 || m->pi_id == s_pi_id);
+            if (m->hdr.version == MSG_VERSION && wid_ok && pi_ok) {
+                ESP_LOGI(TAG, "MODE=%u from pi_id=%lu",
+                         m->mode, (unsigned long)m->pi_id);
+                if (s_mode_cb) s_mode_cb(m->mode);   // must only post an event
+            }
         }
     }
 }
@@ -668,6 +734,8 @@ esp_err_t wifi_udp_forget(void)
 
 void wifi_udp_set_forget_cb(void (*cb)(void)) { s_forget_cb = cb; }
 void wifi_udp_set_orphan_cb(void (*cb)(void)) { s_orphan_cb = cb; }
+void wifi_udp_set_mode_cb(void (*cb)(uint8_t mode)) { s_mode_cb = cb; }
+void wifi_udp_set_reported_mode(uint8_t mode) { s_wmode = mode; }
 
 void wifi_udp_set_radio_policy(wifi_radio_policy_t policy)
 {

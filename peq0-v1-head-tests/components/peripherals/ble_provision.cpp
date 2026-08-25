@@ -241,7 +241,7 @@ static int enrol_access(uint16_t c, uint16_t a, struct ble_gatt_access_ctxt *ctx
 static int status_access(uint16_t c, uint16_t a, struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
-    char buf[64] = "unprovisioned";
+    char buf[BLE_STATUS_MAX] = "unprovisioned";
     if (s_cfg.status_getter) s_cfg.status_getter(buf, sizeof(buf));
     int rc = os_mbuf_append(ctxt->om, buf, strlen(buf));
     return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -396,7 +396,7 @@ void ble_provision_push_status(void)
             || !s_cfg.status_getter) {
         return;
     }
-    char buf[64];
+    char buf[BLE_STATUS_MAX];
     s_cfg.status_getter(buf, sizeof(buf));
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, strlen(buf));
     if (om) ble_gatts_notify_custom(s_conn_handle, s_status_val_handle, om);

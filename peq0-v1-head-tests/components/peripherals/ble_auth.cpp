@@ -106,6 +106,11 @@ void ble_auth_open_window(uint32_t ms)
     ESP_LOGI(TAG, "enrolment window open for %lu s", (unsigned long)(ms / 1000));
 }
 
+void ble_auth_close_window(void)
+{
+    s_window_until_us = 0;
+}
+
 bool ble_auth_window_open(void)
 {
     return esp_timer_get_time() < s_window_until_us;
@@ -136,6 +141,11 @@ esp_err_t ble_auth_read_secret(char *out, size_t n)
     } else {
         ESP_LOGI(TAG, "re-enrolled from the open window");
     }
+    // Claimed — so stop advertising claimability. The press meant "this phone
+    // may have me", not "anyone may have me for the next two minutes", and a
+    // window left open is a 2 Hz LED still asking to be claimed by a board that
+    // already has been. A second phone gets a second press.
+    ble_auth_close_window();
     to_hex(s_secret, sizeof(s_secret), out);
     return ESP_OK;
 }

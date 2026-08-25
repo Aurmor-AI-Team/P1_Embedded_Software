@@ -36,7 +36,15 @@ import protocol
 
 MSG_IMU, MSG_HELLO, MSG_WELCOME, MSG_FORGET = 1, 2, 3, 4
 MSG_ALERT, MSG_ALERT_ACK = 5, 6
+MSG_MODE, MSG_MODE_RPT = 7, 8
 VERSION = 1
+
+# Working modes, mirrored from wearable_mode_t in
+# peq0-v1-head-tests/src/app_ctrl.h. The NAMES are the control-characteristic
+# grammar the app writes ("mode alerts 3"); the NUMBERS are what goes on the
+# UDP wire. Both sides of that mapping live here.
+MODES = {"idle": 0, "live": 1, "alerts": 2, "mock": 3}
+MODE_NAMES = {v: k for k, v in MODES.items()}
 
 HDR = struct.Struct("<BBH")         # msg_type, version, wearable_id  (4)
 IMU_BODY = struct.Struct("<II14f")  # seq, t_ms, 10 IMU + 4 bio floats (64)
@@ -46,6 +54,8 @@ FORGET = struct.Struct("<BBHI")     # header + pi_id                  (8)
 # One head impact: header + seq, t_ms, peak, threshold, sum, max, count, dur.
 ALERT = struct.Struct("<BBHIIffffIH")   # (34)
 ALERT_ACK = struct.Struct("<BBHI")      # header + acked seq          (8)
+MODE = struct.Struct("<BBHIB")          # header + pi_id + mode       (9)
+MODE_RPT = struct.Struct("<BBHB")       # header + mode               (5)
 
 IMU_SIZE = HDR.size + IMU_BODY.size  # 68
 HELLO_SIZE = HELLO.size              # 8
@@ -55,6 +65,8 @@ HELLO_SIZE = HELLO.size              # 8
 # garbage rather than failing, so assert it at import.
 assert ALERT.size == 34, f"ALERT layout drifted: {ALERT.size} != 34"
 assert ALERT_ACK.size == 8, f"ALERT_ACK layout drifted: {ALERT_ACK.size} != 8"
+assert MODE.size == 9, f"MODE layout drifted: {MODE.size} != 9"
+assert MODE_RPT.size == 5, f"MODE_RPT layout drifted: {MODE_RPT.size} != 5"
 
 # Legacy fixed body-position map, kept for mock/replay (CSV) which still uses
 # body-position node names. The LIVE source no longer defaults to it: each board
@@ -105,6 +117,7 @@ class UdpImuSource:
         self._rebase_s: Dict[int, float] = {}    # wid -> offset added after reboots
         self._last_t_s: Dict[int, float] = {}    # wid -> last emitted t_s
         self._last_alert_seq: Dict[int, int] = {}  # wid -> last impact seq queued
+        self._modes: Dict[int, str] = {}         # wid -> working mode it reports
         self._dropped = 0
         self._last_drop_log = 0.0
 
@@ -202,6 +215,54 @@ class UdpImuSource:
         print(f"# forget sent to {sorted(targets)} ({retries}x)", file=sys.stderr)
         return True
 
+    # -- working mode -------------------------------------------------------- #
+    def send_mode(self, wid: int, mode, retries: int = 5,
+                  interval_s: float = 0.2) -> bool:
+        """Tell wearable ``wid`` which working mode to run.
+
+        This is the group-session path: the board is on our WiFi with its BLE
+        off, so the app cannot reach it directly and asks us to relay. ``mode``
+        is a name from MODES or the number itself.
+
+        A wid is REQUIRED — deliberately. The bare-``forget`` broadcast was
+        removed because one unauthenticated write could drop a whole team
+        mid-session, and "silence every board at once" is the same hazard. The
+        app sends one call per board instead; a squad-wide toggle is a UI
+        affordance, not a wire broadcast.
+
+        Fire-and-forget with repeats, like send_forget: the board reports what
+        it actually settled on in its MODE_RPT (see modes()), so there is
+        nothing to ack.
+        """
+        code = MODES.get(mode) if isinstance(mode, str) else int(mode)
+        if code is None or code not in MODE_NAMES:
+            print(f"# mode: unknown mode {mode!r}", file=sys.stderr)
+            return False
+        addr = self._last_addr.get(wid)
+        if addr is None or self._sock is None:
+            print(f"# mode: no known address for wid={wid}", file=sys.stderr)
+            return False
+        pkt = MODE.pack(MSG_MODE, VERSION, wid, self.pi_id, code)
+        for i in range(retries):
+            try:
+                self._sock.sendto(pkt, addr)
+            except OSError as exc:
+                print(f"# mode send failed: {exc}", file=sys.stderr)
+                return False
+            if i + 1 < retries:
+                time.sleep(interval_s)
+        print(f"# mode {MODE_NAMES[code]} sent to wid={wid} ({retries}x)",
+              file=sys.stderr)
+        return True
+
+    def modes(self) -> Dict[int, str]:
+        """wid -> the working mode each board says it is in.
+
+        Sourced from MODE_RPT, not from what we commanded: a board reboots into
+        idle and its BOOT button can start a demo without us knowing.
+        """
+        return dict(self._modes)
+
     # -- receive loop -------------------------------------------------------- #
     def _rx_loop(self) -> None:
         while not self._stop.is_set():
@@ -225,6 +286,18 @@ class UdpImuSource:
                 self._sock.sendto(reply, addr)
                 print(f"# [{addr[0]}] HELLO wid={wid} -> WELCOME (pi_id={self.pi_id})",
                       file=sys.stderr)
+                continue
+
+            if msg_type == MSG_MODE_RPT and len(data) == MODE_RPT.size:
+                # Rides alongside every HELLO. Counts as liveness too: a board
+                # in alerts mode may send no telemetry for minutes.
+                self._last_addr[wid] = addr
+                self._last_seen[wid] = time.monotonic()
+                code = MODE_RPT.unpack(data)[3]
+                name = MODE_NAMES.get(code)
+                if name is not None and self._modes.get(wid) != name:
+                    print(f"# [{addr[0]}] wid={wid} mode={name}", file=sys.stderr)
+                self._modes[wid] = name or f"?{code}"
                 continue
 
             if msg_type == MSG_IMU and len(data) == IMU_SIZE:

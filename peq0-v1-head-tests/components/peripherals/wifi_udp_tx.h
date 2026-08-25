@@ -29,6 +29,16 @@ esp_err_t wifi_udp_forget(void);
 // The callback must only post an event (it runs on the rx task).
 void wifi_udp_set_forget_cb(void (*cb)(void));
 
+// Invoked from the UDP receive task when the Pi relays a working mode the app
+// picked (MSG_MODE). `mode` is a wearable_mode_t; app_ctrl validates it. This is
+// the group-session path — the board is on WiFi with its BLE off, so the phone
+// cannot reach it directly. The callback must only post an event.
+void wifi_udp_set_mode_cb(void (*cb)(uint8_t mode));
+
+// The working mode to report in every HELLO, so the receiver can see what each
+// board is doing. app_ctrl pushes it here on every change; nothing reads it back.
+void wifi_udp_set_reported_mode(uint8_t mode);
+
 // How hard we chase the network when we are not on it.
 //
 // A wearable that has been provisioned retries FOREVER — it must re-join its own

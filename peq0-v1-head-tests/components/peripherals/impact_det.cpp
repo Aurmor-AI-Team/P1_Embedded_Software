@@ -73,9 +73,18 @@ static void backlog_push(const impact_rec_t *r)
     }
 }
 
+// Whether records may leave the board at all. False in the IDLE and MOCK
+// working modes; see impact_det_set_delivery_enabled(). Starts false because a
+// board boots into IDLE.
+static volatile bool s_deliver = false;
+
 /** Try both transports. Returns true if the record left the board. */
 static bool dispatch(const impact_rec_t *r)
 {
+    // The mode says nothing goes out. Refusing here (rather than earlier) is
+    // deliberate: the caller then backlogs the record, so leaving IDLE replays
+    // every hit that happened while we were quiet.
+    if (!s_deliver) return false;
     if (ble_stream_ready() && ble_stream_send_impact(r) == ESP_OK) return true;
     if (wifi_udp_is_verified() && wifi_udp_send_alert(r) == ESP_OK) return true;
     return false;
@@ -133,6 +142,18 @@ void impact_det_init(void)
              (double)IMPACT_THRESHOLD_G, IMPACT_WINDOW_US / 1000,
              IMPACT_REFRACTORY_US / 1000);
 }
+
+void impact_det_set_delivery_enabled(bool on)
+{
+    if (on == s_deliver) return;
+    s_deliver = on;
+    ESP_LOGI(TAG, "delivery %s (%u record(s) held)",
+             on ? "enabled" : "disabled", (unsigned)s_backlog_count);
+    // Nothing to kick here: impact_det_service() runs at 10 Hz from the IMU task
+    // and drains the backlog on its own now that dispatch() will accept.
+}
+
+bool impact_det_delivery_enabled(void) { return s_deliver; }
 
 void impact_det_feed(const lsm6_sample_t *s, float h_mag)
 {

@@ -82,16 +82,22 @@ static void imu_print_task(void *arg)
 
         lsm6_sample_t s;
         if (xQueueReceive(s_imu_q, &s, wait_ticks) == pdTRUE) {
+            // The one gate for live telemetry: WMODE_LIVE, with mock playback
+            // stopped (it owns the wire while it runs, so the Pi never sees CSV
+            // rows and real samples interleaved). IDLE and ALERTS put nothing
+            // here — in ALERTS the only traffic is impact records, which is why
+            // the session screen simply updates less often rather than
+            // differently. Applies to BOTH transports: the mode is what the user
+            // picked, independent of which radio is carrying it.
+            const bool stream = app_ctrl_stream_enabled();
             if (++udp_decim >= UDP_DECIMATE) {
                 udp_decim = 0;
-                // Live sensor stream pauses while the mock CSV plays, so the
-                // Pi never sees the two interleaved.
-                if (!mock_playback_is_active()) wifi_udp_send_imu(&s);
+                if (stream) wifi_udp_send_imu(&s);
             }
             // Solo sessions read straight off the board over BLE instead of
             // going through the Pi. No-op unless a client is subscribed, and
             // internally rate-limited, so it is safe at the full sample rate.
-            if (!mock_playback_is_active()) ble_stream_notify(&s);
+            if (stream) ble_stream_notify(&s);
             float h_mag = sqrtf(s.hx_g * s.hx_g + s.hy_g * s.hy_g + s.hz_g * s.hz_g);
             // Detection runs in EVERY state: during mock playback, with no radio
             // up, unprovisioned. impact_det decides whether to send or hold.

@@ -71,6 +71,10 @@ void setUp(void)
     s_wifi_up = false;
     s_sent.clear();
     impact_det_init();
+    // Delivery defaults OFF (a board boots into the IDLE working mode). These
+    // tests are about the DETECTOR, so turn it on here and let the two mode
+    // tests below own the off case.
+    impact_det_set_delivery_enabled(true);
     // impact_det_init() does not reset the running totals (they are boot-scoped
     // by design), so tests assert on s_sent rather than on impact_det_count().
 }
@@ -285,6 +289,47 @@ void test_inject_produces_a_record(void)
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 35.0f, s_sent[0].peak_g);
 }
 
+// --- the working-mode delivery gate ----------------------------------------
+// IDLE and MOCK promise that nothing goes on the wire. The thing that must NOT
+// happen is that they also lose the hit: an athlete who takes a knock while the
+// app happens to be sitting in idle still took that knock.
+
+void test_delivery_disabled_holds_records_rather_than_dropping_them(void)
+{
+    impact_det_set_delivery_enabled(false);
+    s_ble_up = true;   // a transport IS up — the mode is the only thing stopping us
+
+    for (int i = 0; i < 5; i++) feed(35.0f);
+    feed(1.0f);
+    impact_det_service();
+
+    TEST_ASSERT_EQUAL_UINT32(0, s_sent.size());      // nothing on the wire
+    TEST_ASSERT_EQUAL_UINT8(1, impact_det_backlog()); // but not lost
+}
+
+void test_re_enabling_delivery_drains_what_idle_held(void)
+{
+    impact_det_set_delivery_enabled(false);
+    s_ble_up = true;
+
+    // Three hits while the board is quiet.
+    for (int hit = 0; hit < 3; hit++) {
+        for (int i = 0; i < 5; i++) feed(35.0f);
+        feed(1.0f);
+        test_clock_advance_us(IMPACT_REFRACTORY_US);
+    }
+    impact_det_service();
+    TEST_ASSERT_EQUAL_UINT32(0, s_sent.size());
+
+    // The user picks live/alerts: the backlog goes out on the next housekeeping
+    // pass (IMPACT_DRAIN_PER_TICK is 4, so one call covers three).
+    impact_det_set_delivery_enabled(true);
+    impact_det_service();
+
+    TEST_ASSERT_EQUAL_UINT32(3, s_sent.size());
+    TEST_ASSERT_EQUAL_UINT8(0, impact_det_backlog());
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -303,5 +348,7 @@ int main(int, char **)
     RUN_TEST(test_drain_is_rate_limited_per_service_call);
     RUN_TEST(test_running_totals_accumulate_across_hits);
     RUN_TEST(test_inject_produces_a_record);
+    RUN_TEST(test_delivery_disabled_holds_records_rather_than_dropping_them);
+    RUN_TEST(test_re_enabling_delivery_drains_what_idle_held);
     return UNITY_END();
 }

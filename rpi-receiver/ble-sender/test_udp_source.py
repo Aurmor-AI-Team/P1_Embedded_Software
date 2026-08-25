@@ -17,9 +17,10 @@ import protocol
 import udp_source
 import wifi_ap
 from test_binary_protocol import decode_sample, iter_records
-from udp_source import (ALERT, ALERT_ACK, FORGET, HELLO, IMU_BODY, HDR,
-                        MSG_ALERT, MSG_ALERT_ACK, MSG_FORGET, MSG_IMU,
-                        MSG_WELCOME, UdpImuSource, VERSION, WELCOME)
+from udp_source import (ALERT, ALERT_ACK, FORGET, HELLO, IMU_BODY, HDR, MODE,
+                        MODE_RPT, MODES, MSG_ALERT, MSG_ALERT_ACK, MSG_FORGET,
+                        MSG_IMU, MSG_MODE, MSG_MODE_RPT, MSG_WELCOME,
+                        UdpImuSource, VERSION, WELCOME)
 
 
 def make_imu(wid: int, seq: int, t_ms: int, values=None) -> bytes:
@@ -34,6 +35,23 @@ def make_alert(wid: int, seq: int, t_ms: int, peak_g: float = 41.23,
                max_g: float = 41.23, count: int = 3, dur_ms: int = 18) -> bytes:
     return ALERT.pack(MSG_ALERT, VERSION, wid, seq, t_ms,
                       peak_g, threshold_g, sum_g, max_g, count, dur_ms)
+
+
+def drain_socket(sock) -> None:
+    """Discard anything already queued on ``sock`` (restores its timeout)."""
+    prev = sock.gettimeout()
+    sock.settimeout(0.0)
+    try:
+        while True:
+            sock.recvfrom(256)
+    except (BlockingIOError, socket.timeout, OSError):
+        pass
+    finally:
+        sock.settimeout(prev)
+
+
+def make_mode_rpt(wid: int, mode: int) -> bytes:
+    return MODE_RPT.pack(MSG_MODE_RPT, VERSION, wid, mode)
 
 
 def wait_for(predicate, timeout_s: float = 2.0):
@@ -141,6 +159,36 @@ def run_source_tests() -> int:
     assert (mt, ver, wid, pi_id) == (MSG_FORGET, VERSION, 1, 42), (mt, ver, wid, pi_id)
     assert src.send_forget(55) is False, "unknown wid must report undeliverable"
     print("FORGET layout + addressing OK")
+
+    # send_forget above repeated itself; drop the extra copies so the reads
+    # below see MODE datagrams rather than the tail of that burst.
+    drain_socket(client)
+
+    # MODE goes to the wid's last-seen address with our pi_id, by name or number.
+    assert src.send_mode(1, "alerts", retries=1) is True
+    data, _ = client.recvfrom(64)
+    assert MODE.unpack(data) == (MSG_MODE, VERSION, 1, 42, MODES["alerts"]), \
+        MODE.unpack(data)
+    assert src.send_mode(1, 1, retries=1) is True          # numeric form
+    assert MODE.unpack(client.recvfrom(64)[0])[4] == MODES["live"]
+    # A wid is required and must be known; an unknown mode is refused outright
+    # rather than sent as a number the board would reject anyway.
+    assert src.send_mode(55, "live") is False, "unknown wid must report undeliverable"
+    assert src.send_mode(1, "turbo") is False, "unknown mode must be refused"
+    print("MODE layout + addressing OK")
+
+    # MODE_RPT: the board tells us what it is ACTUALLY in. Counts as liveness
+    # too — a board in alerts mode may send no telemetry for minutes.
+    assert src.modes().get(1) is None
+    client.sendto(make_mode_rpt(1, MODES["mock"]), dest)
+    assert wait_for(lambda: src.modes().get(1) == "mock"), src.modes()
+    client.sendto(make_mode_rpt(1, MODES["idle"]), dest)
+    assert wait_for(lambda: src.modes().get(1) == "idle"), src.modes()
+    # An unknown code is recorded rather than dropped: a newer board reporting a
+    # mode this Pi has never heard of should still read as present and odd.
+    client.sendto(make_mode_rpt(1, 200), dest)
+    assert wait_for(lambda: src.modes().get(1) == "?200"), src.modes()
+    print("MODE_RPT tracking OK")
 
     src.stop()
     client.close()

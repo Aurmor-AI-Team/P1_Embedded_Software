@@ -19,10 +19,13 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 
+#include <string.h>
+
 #include "ble_auth.h"
 #include "ble_provision.h"
 #include "ble_stream.h"
 #include "button.h"
+#include "impact_det.h"
 #include "mock_playback.h"
 #include "wifi_udp_tx.h"
 
@@ -49,10 +52,20 @@ typedef enum {
     EVT_WIFI_ORPHANED,   // receiver gone: hand the board back to Bluetooth
     EVT_STREAM_ON,       // a phone subscribed to the BLE IMU stream
     EVT_STREAM_OFF,      // ...and stopped
+    EVT_SET_WMODE,       // the app picked a working mode (over BLE or via the Pi)
+} app_event_id_t;
+
+// The queue carries a payload now, because a mode change has to say WHICH mode.
+typedef struct {
+    app_event_id_t id;
+    uint8_t        wmode;   // EVT_SET_WMODE only
 } app_event_t;
 
 static QueueHandle_t s_events;
 static volatile app_mode_t s_mode = APP_MODE_IDLE;
+// The working mode the user picked. Volatile: the IMU task reads it per sample.
+// IDLE at boot, never restored from NVS — see app_ctrl.h.
+static volatile wearable_mode_t s_wmode = WMODE_IDLE;
 // True while we are advertising over BLE but STILL HOLD WiFi credentials: the
 // receiver went away and we handed the board back to Bluetooth so the app can
 // reach it, without forgetting the network we belong to. Distinguishes this
@@ -74,13 +87,16 @@ static void status_getter(char *buf, size_t n)
 {
     char ip[16];
     wifi_udp_get_ip(ip, sizeof(ip));
-    snprintf(buf, n, "%s ip=%s wid=%u %s pi=%lu",
+    // `mode=` is how the app confirms a mode write actually took — the Control
+    // characteristic write itself only tells it the bytes arrived.
+    snprintf(buf, n, "%s ip=%s wid=%u %s pi=%lu mode=%s",
              wifi_udp_is_connected() ? "up" : "down",
              ip,
              wifi_udp_get_wearable_id(),
              !wifi_udp_has_target() ? "notgt"
                : wifi_udp_is_verified() ? "verified" : "unverified",
-             (unsigned long)wifi_udp_get_pi_id());
+             (unsigned long)wifi_udp_get_pi_id(),
+             app_wmode_str(s_wmode));
 }
 
 static const ble_provision_cfg_t s_ble_cfg = {
@@ -91,15 +107,40 @@ static const ble_provision_cfg_t s_ble_cfg = {
 };
 
 // --- event producers (each only posts to the queue) -------------------------
-static void post_event(app_event_t evt)
+static void post_event(app_event_id_t id)
 {
-    if (s_events) xQueueSend(s_events, &evt, 0);
+    app_event_t e = { id, 0 };
+    if (s_events) xQueueSend(s_events, &e, 0);
+}
+
+static void post_wmode(uint8_t m)
+{
+    app_event_t e = { EVT_SET_WMODE, m };
+    if (s_events) xQueueSend(s_events, &e, 0);
 }
 
 static void button_cb(button_event_t evt)
 {
     post_event(evt == BUTTON_EVT_LONG ? EVT_BTN_LONG : EVT_BTN_SHORT);
 }
+
+// Both control paths land here: the BLE Control characteristic on the stream
+// service (solo — the phone is talking to this board) and a MSG_MODE datagram
+// relayed by the receiver (group — the phone is talking to the Pi). Each runs
+// on someone else's task, so both only post.
+//
+// BLE carries the mode as a NAME and UDP as a byte, which is not an oversight:
+// the BLE control characteristic is a human-readable text grammar shared with
+// the receiver, while the datagram is a fixed binary struct.
+static bool ble_mode_cb(const char *arg)
+{
+    wearable_mode_t m;
+    if (!app_wmode_from_str(arg, &m)) return false;
+    post_wmode((uint8_t)m);
+    return true;
+}
+
+static void udp_mode_cb(uint8_t m) { post_wmode(m); }
 
 static void forget_cb(void)
 {
@@ -140,7 +181,8 @@ static void led_tick_cb(void *arg)
         // to be using is the app's business, not something to read off an LED.
         //
         // Every other pattern is therefore an EXCEPTION worth noticing:
-        //   2 Hz  — enrolment window open, "claim me now" (closes in 2 min)
+        //   2 Hz  — enrolment window open, "claim me now" (closes on claim,
+        //           or after 2 min if nobody does)
         //   1 Hz  — mock playback running
         //   double flash — orphaned: lost its receiver, back on Bluetooth and
         //                  still hunting, which is tellable from never-paired.
@@ -181,6 +223,73 @@ static void led_init(void)
     }
 }
 
+// --- working mode -------------------------------------------------------------
+const char *app_wmode_str(wearable_mode_t m)
+{
+    switch (m) {
+    case WMODE_LIVE:   return "live";
+    case WMODE_ALERTS: return "alerts";
+    case WMODE_MOCK:   return "mock";
+    default:           return "idle";
+    }
+}
+
+bool app_wmode_from_str(const char *s, wearable_mode_t *out)
+{
+    if (!s || !out) return false;
+    while (*s == ' ') s++;
+    for (uint8_t m = WMODE_IDLE; m <= WMODE_MOCK; m++) {
+        const char *name = app_wmode_str((wearable_mode_t)m);
+        size_t len = strlen(name);
+        // Prefix match, then insist the next char ends the word — so "mode live
+        // 3" parses and "mode livewire" does not.
+        if (strncmp(s, name, len) == 0 && (s[len] == '\0' || s[len] == ' ')) {
+            *out = (wearable_mode_t)m;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The ONLY writer of s_wmode. Runs on the ctrl task, so it is free to call into
+// the radios; every producer posts EVT_SET_WMODE instead of calling this.
+static void apply_wmode(wearable_mode_t m)
+{
+    if (m == s_wmode) return;   // idempotent: a repeated write from the app is free
+
+    // Mock playback must be stopped on EVERY transition out of MOCK. A demo
+    // that survives into the next mode keeps feeding the receiver, and the next
+    // short-press stops the STALE playback instead of starting a new one — so
+    // the user presses the button, sees nothing, and only gets data on the
+    // second press.
+    if (s_wmode == WMODE_MOCK) mock_playback_stop();
+
+    ESP_LOGI(TAG, "working mode: %s -> %s", app_wmode_str(s_wmode), app_wmode_str(m));
+    s_wmode = m;
+
+    // Only IDLE is silent. MOCK very much is not: the CSV has head impacts
+    // spliced into it (gen_head_mock.py) precisely so a demo exercises the
+    // impact pipeline, and a demo that shows telemetry but never an impact
+    // demonstrates the least interesting half of this product. In a production
+    // build the detector is fed by the REAL sensor throughout playback anyway,
+    // and a real hit during a demo is still a real hit.
+    //
+    // While IDLE holds them, impact_det keeps detecting and backlogs, so
+    // leaving IDLE replays what happened during the silence.
+    impact_det_set_delivery_enabled(m != WMODE_IDLE);
+    wifi_udp_set_reported_mode((uint8_t)m);   // rides out on the next HELLO
+
+    // Re-anchor the app's decoder before the first frame of a mode that sends.
+    // A board can sit in IDLE for minutes after the phone subscribed, and a
+    // client that no longer holds the decode tables drops every sample in
+    // silence — indistinguishable, on screen, from a wearable sending nothing.
+    if (m != WMODE_IDLE) ble_stream_request_meta();
+
+    if (m == WMODE_MOCK) mock_playback_start_loop();
+
+    ble_provision_push_status();   // the app reads the new mode back from here
+}
+
 // --- state machine ------------------------------------------------------------
 static void enter_pairing(void)
 {
@@ -195,9 +304,20 @@ static void enter_pairing(void)
 
 static void ctrl_task(void *arg)
 {
-    app_event_t evt;
+    app_event_t e;
     while (true) {
-        if (xQueueReceive(s_events, &evt, portMAX_DELAY) != pdTRUE) continue;
+        if (xQueueReceive(s_events, &e, portMAX_DELAY) != pdTRUE) continue;
+
+        // Handled before the state switch: the working mode is orthogonal to
+        // the radio state, so the app can set it whether we are advertising on
+        // Bluetooth or sitting on the receiver's WiFi.
+        if (e.id == EVT_SET_WMODE) {
+            if (e.wmode <= WMODE_MOCK) apply_wmode((wearable_mode_t)e.wmode);
+            else ESP_LOGW(TAG, "ignoring unknown working mode %u", e.wmode);
+            continue;
+        }
+
+        const app_event_id_t evt = e.id;
 
         switch (s_mode) {
         case APP_MODE_IDLE:
@@ -212,10 +332,10 @@ static void ctrl_task(void *arg)
         case APP_MODE_PAIRING:
             if (evt == EVT_BTN_SHORT) {
                 // Same demo as in WIFI mode, down the BLE stream instead: lets
-                // a solo session be shown off with no receiver present. Refused
-                // by mock_playback_start() when nothing is subscribed.
-                if (mock_playback_is_active()) mock_playback_stop();
-                else mock_playback_start();
+                // a solo session be shown off with no receiver present. Routed
+                // through the working mode so the button and the app can never
+                // disagree about whether a demo is running.
+                apply_wmode(s_wmode == WMODE_MOCK ? WMODE_IDLE : WMODE_MOCK);
             } else if (evt == EVT_STREAM_ON) {
                 // A phone is streaming from us. If we're orphaned we still have
                 // credentials and are quietly hunting for our receiver — stop,
@@ -246,8 +366,9 @@ static void ctrl_task(void *arg)
                 // feeding the Pi over UDP — and the next short-press STOPS that
                 // stale playback instead of starting a new one, so the user
                 // presses the button, sees nothing happen, and only gets data
-                // on the second press.
-                mock_playback_stop();
+                // on the second press. Back to IDLE: the app re-picks a working
+                // mode once the group session is up.
+                apply_wmode(WMODE_IDLE);
                 // Let the app read/receive the "up ..." status before BLE dies.
                 ble_provision_push_status();
                 vTaskDelay(pdMS_TO_TICKS(BLE_STOP_DELAY_MS));
@@ -269,8 +390,7 @@ static void ctrl_task(void *arg)
 
         case APP_MODE_WIFI:
             if (evt == EVT_BTN_SHORT) {
-                if (mock_playback_is_active()) mock_playback_stop();
-                else mock_playback_start();
+                apply_wmode(s_wmode == WMODE_MOCK ? WMODE_IDLE : WMODE_MOCK);
             } else if (evt == EVT_BTN_LONG) {
                 // Manual escape back to Bluetooth. This is safe to offer now
                 // that boards are claimed: returning to BLE no longer means
@@ -286,7 +406,11 @@ static void ctrl_task(void *arg)
                 // Forgets rather than merely disconnecting — otherwise the
                 // background retry would drag it straight back onto the network
                 // the user just asked it to leave.
-                mock_playback_stop();
+                //
+                // Back to IDLE as well: this press ends the board's involvement
+                // with whoever was driving it, so it should go quiet until
+                // someone picks a mode again.
+                apply_wmode(WMODE_IDLE);
                 wifi_udp_forget();
                 s_orphaned = false;
                 s_mode = APP_MODE_IDLE;   // off the network; enter_pairing() promotes
@@ -299,7 +423,11 @@ static void ctrl_task(void *arg)
                 // directly). Advertise again rather than going dark: BLE is the
                 // only channel back to a board that is off the WiFi, so going
                 // IDLE here would strand it until someone held BOOT.
-                mock_playback_stop();
+                //
+                // This is the end of a group session in practice, so go quiet
+                // too — the app sets a working mode again when the next one
+                // starts, and a board left looping a demo is a support call.
+                apply_wmode(WMODE_IDLE);
                 wifi_udp_forget();
                 s_orphaned = false;       // deliberate release, not a lost receiver
                 s_mode = APP_MODE_IDLE;   // off the network; enter_pairing() promotes
@@ -310,7 +438,12 @@ static void ctrl_task(void *arg)
                 // KEEP the credentials and keep hunting in the background, so a
                 // receiver that merely rebooted is rejoined without the user
                 // doing anything. (Contrast EVT_FORGET_RX, which is deliberate.)
-                mock_playback_stop();
+                //
+                // The working mode is deliberately KEPT here. Nobody asked for
+                // anything — a wearable that walks out of receiver range should
+                // come back doing what it was told to do, and impacts detected
+                // in the meantime are held by impact_det and delivered when a
+                // transport returns. Only a deliberate release goes to IDLE.
                 s_orphaned = true;
                 wifi_udp_set_radio_policy(WIFI_RADIO_BACKGROUND);
                 s_mode = APP_MODE_IDLE;   // enter_pairing() promotes on success
@@ -336,6 +469,14 @@ esp_err_t app_ctrl_init(void)
     wifi_udp_set_forget_cb(forget_cb);
     wifi_udp_set_orphan_cb(orphan_cb);
     ble_stream_set_subscriber_cb(stream_subscriber_cb);
+
+    // The two ways the app can set a working mode: straight over BLE when it is
+    // connected to this board (solo), or relayed as a UDP datagram by the
+    // receiver when it isn't (group). Same enum, same handler.
+    ble_stream_set_mode_cb(ble_mode_cb);
+    wifi_udp_set_mode_cb(udp_mode_cb);
+    // IDLE at boot means nothing on the wire — including impacts.
+    impact_det_set_delivery_enabled(false);
 
     err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                               &ip_event_cb, NULL, NULL);
@@ -363,3 +504,14 @@ esp_err_t app_ctrl_init(void)
 }
 
 app_mode_t app_ctrl_mode(void) { return s_mode; }
+
+wearable_mode_t app_ctrl_wearable_mode(void) { return s_wmode; }
+
+void app_ctrl_set_wearable_mode(wearable_mode_t m) { post_wmode((uint8_t)m); }
+
+bool app_ctrl_stream_enabled(void)
+{
+    // MOCK owns the wire while it plays: the live sensor stream stays off so
+    // the receiver never sees CSV rows and real samples interleaved.
+    return s_wmode == WMODE_LIVE && !mock_playback_is_active();
+}

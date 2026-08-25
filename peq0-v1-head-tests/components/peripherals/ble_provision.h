@@ -17,6 +17,13 @@ typedef void (*ble_provision_cb_t)(const char *ssid, const char *password,
 // characteristic (e.g. "up ip=192.168.1.42 pi=7 ok").
 typedef void (*ble_status_getter_t)(char *buf, size_t n);
 
+// Size of the status buffer. Was 64 until the working mode joined the string,
+// which pushed a fully-populated status ("up ip=… wid=… unverified pi=… mode=…")
+// past it — and snprintf truncates silently, so the app would have read a status
+// with the mode sheared off the end. Reads are ATT long reads and fine at any
+// length; a NOTIFY is still capped at MTU-3.
+#define BLE_STATUS_MAX 96
+
 typedef struct {
     ble_provision_cb_t  on_provision;        // SSID+pass+target committed
     void (*on_wearable_id)(uint16_t id);     // wearable ID written (may be NULL)

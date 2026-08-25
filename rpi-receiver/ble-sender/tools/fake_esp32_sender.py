@@ -23,6 +23,7 @@ from pathlib import Path
 
 MSG_IMU, MSG_HELLO, MSG_WELCOME, MSG_FORGET = 1, 2, 3, 4
 MSG_ALERT, MSG_ALERT_ACK = 5, 6
+MSG_MODE, MSG_MODE_RPT = 7, 8
 VERSION = 1
 IMU = struct.Struct("<BBHII14f")   # 10 IMU + 4 bio (hr, spo2, resp, hrv)
 HELLO = struct.Struct("<BBHI")
@@ -30,6 +31,11 @@ WELCOME = struct.Struct("<BBHII")
 FORGET = struct.Struct("<BBHI")
 ALERT = struct.Struct("<BBHIIffffIH")   # seq, t_ms, peak, thresh, sum, max, count, dur
 ALERT_ACK = struct.Struct("<BBHI")
+MODE = struct.Struct("<BBHIB")       # header + pi_id + mode
+MODE_RPT = struct.Struct("<BBHB")    # header + mode
+
+# Mirrors wearable_mode_t in peq0-v1-head-tests/src/app_ctrl.h.
+MODE_NAMES = {0: "idle", 1: "live", 2: "alerts", 3: "mock"}
 
 IMU_FIELDS = ("ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
               "hx_g", "hy_g", "hz_g", "imu_temp_c")
@@ -102,6 +108,7 @@ def main():
     t0 = time.monotonic()
     last_hello = 0.0
     last_impact = time.monotonic()
+    mode = 0              # WMODE_IDLE, the mode a board boots into
     impact_seq = 0
     impact_count = 0
     impact_sum = 0.0
@@ -111,6 +118,10 @@ def main():
         now = time.monotonic()
         if now - last_hello >= 2.0:
             sock.sendto(HELLO.pack(MSG_HELLO, VERSION, args.wid, seq), dest)
+            # The board reports its working mode alongside every HELLO — a
+            # separate message rather than a longer HELLO, so an un-upgraded
+            # peer on either side keeps handshaking (see wifi_udp_tx.cpp).
+            sock.sendto(MODE_RPT.pack(MSG_MODE_RPT, VERSION, args.wid, mode), dest)
             last_hello = now
 
         values = rows[seq % len(rows)] if rows else synth_row(seq)
@@ -159,6 +170,11 @@ def main():
                     _, _, wid, nonce, pi_id = WELCOME.unpack(data)
                     print(f"# WELCOME from {addr[0]}: wid={wid} pi_id={pi_id}",
                           file=sys.stderr)
+                elif msg_type == MSG_MODE and len(data) == MODE.size:
+                    _, _, wid, pi_id, code = MODE.unpack(data)
+                    mode = code
+                    print(f"# MODE from {addr[0]}: wid={wid} pi_id={pi_id} "
+                          f"mode={MODE_NAMES.get(code, code)}", file=sys.stderr)
                 elif msg_type == MSG_FORGET and len(data) == FORGET.size:
                     _, _, wid, pi_id = FORGET.unpack(data)
                     print(f"# FORGET from {addr[0]}: wid={wid} pi_id={pi_id} "

@@ -18,7 +18,12 @@ from typing import Dict, Iterator, List, Tuple
 SERVICE_UUID = "5a8e0000-9b1a-4c7d-8e2f-1f3a5b7c9d10"
 META_UUID = "5a8e0001-9b1a-4c7d-8e2f-1f3a5b7c9d10"      # read   -> JSON descriptor
 DATA_UUID = "5a8e0002-9b1a-4c7d-8e2f-1f3a5b7c9d10"      # notify -> binary-v1 byte stream
-CONTROL_UUID = "5a8e0003-9b1a-4c7d-8e2f-1f3a5b7c9d10"   # write  -> start/stop/restart/forget [wid]
+# write -> start | stop | restart | forget <wid> | mode <idle|live|alerts|mock> <wid>
+# A wearable serves this same characteristic and answers the same words (it
+# ignores everything but 'mode', which it applies to itself and which therefore
+# needs no wid there). Mirrored in ble_stream.cpp and the app's
+# features/esp32-provisioning/wearableMode.ts.
+CONTROL_UUID = "5a8e0003-9b1a-4c7d-8e2f-1f3a5b7c9d10"
 WIFI_CREDS_UUID = "5a8e0004-9b1a-4c7d-8e2f-1f3a5b7c9d10"  # read -> JSON {ssid,password,ip,port,pi_id}
 WEARABLES_UUID = "5a8e0005-9b1a-4c7d-8e2f-1f3a5b7c9d10"   # read -> JSON {"active":[{"wid","node"}]}
 

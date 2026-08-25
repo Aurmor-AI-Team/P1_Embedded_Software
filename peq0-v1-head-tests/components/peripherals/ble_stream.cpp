@@ -71,6 +71,7 @@ static volatile bool s_subscribed = false;
 static int64_t  s_last_send_us = 0;
 static volatile bool s_meta_pending = false;
 static void (*s_subscriber_cb)(bool streaming) = NULL;
+static bool (*s_mode_cb)(const char *arg) = NULL;
 
 // send_record() is called from TWO tasks: the NimBLE host task (Meta, on
 // subscribe) and the IMU task (samples and impacts). It emits one record as N
@@ -181,14 +182,16 @@ static void build_meta(void)
 // sending
 // ---------------------------------------------------------------------------
 
-/** Frame `payload` as a binary-v1 record and notify it in <=chunk_size pieces. */
-static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
+/** Frame `payload` as a binary-v1 record and notify it in <=chunk_size pieces.
+ *  Returns true only if the WHOLE record went out — callers that owe the app
+ *  something (Meta) must know when they still owe it. */
+static bool send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
 {
     // Single gate for everything that leaves this module, Meta included — an
     // unauthenticated peer must not learn the board's node id or field layout
     // either, and suppressing Meta here is what makes the re-send in
     // ble_stream_on_auth() the one place that decides it is finally allowed.
-    if (!ble_stream_ready()) return;
+    if (!ble_stream_ready()) return false;
 
     // Notifications must fit the negotiated ATT MTU (minus the 3-byte opcode +
     // handle). Never assume the 247 we ask for — iOS lands around 185.
@@ -207,7 +210,7 @@ static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
     // can lose an impact's true peak).
     if (s_tx_lock && xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
         ESP_LOGW(TAG, "tx busy — dropped a type-%u record", (unsigned)msg_type);
-        return;
+        return false;
     }
 
     // The record is header + payload as one byte stream, chunked without regard
@@ -239,12 +242,23 @@ static void send_record(uint8_t msg_type, const uint8_t *payload, size_t len)
     }
 
     if (s_tx_lock) xSemaphoreGive(s_tx_lock);
+    return sent == total;
 }
 
-static void send_meta(void)
+/** Returns true if the decode tables actually reached the app. */
+static bool send_meta(void)
 {
-    if (s_meta_len == 0) return;
-    send_record(MSG_META, (const uint8_t *)s_meta, s_meta_len);
+    if (s_meta_len == 0) {
+        ESP_LOGE(TAG, "no meta to send — the app can decode nothing");
+        return false;
+    }
+    const bool ok = send_record(MSG_META, (const uint8_t *)s_meta, s_meta_len);
+    // Worth a line every time. Meta is the difference between a stream the app
+    // renders and one it silently discards, and when it goes missing there is
+    // otherwise nothing on either side that says so.
+    if (ok) ESP_LOGI(TAG, "meta sent (%u bytes)", (unsigned)s_meta_len);
+    else    ESP_LOGW(TAG, "meta NOT sent (link not ready?) — still owed");
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +306,14 @@ void ble_stream_on_auth(uint16_t conn_handle)
 
 void ble_stream_set_subscriber_cb(void (*cb)(bool streaming)) { s_subscriber_cb = cb; }
 
+void ble_stream_request_meta(void)
+{
+    // Deliberately queued rather than sent: this is called from app_ctrl's task
+    // on a mode change, and the send belongs on the task that normally sends.
+    s_meta_pending = true;
+    s_last_send_us = 0;   // don't make the first frame of the new mode wait
+}
+
 void ble_stream_on_subscribe(uint16_t conn_handle, uint16_t data_handle, bool enabled)
 {
     const bool was = s_subscribed;
@@ -304,10 +326,14 @@ void ble_stream_on_subscribe(uint16_t conn_handle, uint16_t data_handle, bool en
     ESP_LOGI(TAG, "client subscribed; streaming node \"%s\" at %d ms", s_node,
              STREAM_PERIOD_MS);
     // Meta first, always: the app holds every sample it can't decode. If this
-    // connection hasn't authenticated yet, send_record() drops it — and
-    // ble_stream_on_auth() re-sends it the moment that changes.
-    s_meta_pending = false;
-    send_meta();
+    // connection hasn't authenticated yet, or the tx lock is busy, send_meta()
+    // reports the failure and we stay in debt — the next send settles it.
+    //
+    // The debt MUST outlive a failed attempt. Clearing the flag before trying
+    // (as this did) meant a Meta dropped here was forgotten, and the app then
+    // discarded every sample for the life of the connection with nothing in the
+    // log to say why.
+    s_meta_pending = !send_meta();
     s_last_send_us = 0;   // let the next sample through immediately
 }
 
@@ -465,9 +491,31 @@ int ble_stream_control_access(uint16_t conn, uint16_t attr,
     }
 #endif
 
+    // "mode <idle|live|alerts|mock> [wid]" — the solo-session path for setting
+    // the working mode. A group session sends the same words to the RECEIVER,
+    // which relays them to the boards as MSG_MODE datagrams (wifi_udp_tx.cpp),
+    // so the two transports share one grammar.
+    if (strncmp(buf, "mode ", 5) == 0) {
+        // NOT BLE_ATT_ERR_INSUFFICIENT_AUTHEN — that tells the central this
+        // attribute needs an encrypted link, so it starts bonding, which this
+        // server cannot do, and the phone drops the link entirely.
+        if (!ble_auth_conn_allowed(conn)) return ATT_ERR_NOT_AUTHORIZED;
+        if (!s_mode_cb || !s_mode_cb(buf + 5)) {
+            ESP_LOGW(TAG, "control: unknown mode in \"%s\"", buf);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        ESP_LOGI(TAG, "control: \"%s\"", buf);
+        return 0;
+    }
+
     // The receiver's grammar is start|stop|restart|forget [wid]. A wearable
     // streams whenever a client is subscribed and has nothing to forget over
     // this link, so we accept and ignore.
     ESP_LOGI(TAG, "control: \"%s\" (ignored)", buf);
     return 0;
+}
+
+void ble_stream_set_mode_cb(bool (*cb)(const char *arg))
+{
+    s_mode_cb = cb;
 }

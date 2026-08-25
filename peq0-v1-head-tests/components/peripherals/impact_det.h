@@ -62,6 +62,22 @@ typedef struct {
 
 void impact_det_init(void);
 
+// Whether completed records may go out on the wire. Detection is NOT affected:
+// records still get built and still land in the backlog, so nothing is lost
+// while delivery is off — impact_det_service() drains them once it comes back.
+//
+// This is how the IDLE working mode stays quiet (see app_ctrl.h) — and ONLY
+// idle: live, alerts and mock all deliver. It is a plain flag rather than a call
+// into app_ctrl because peripherals must not depend on src/. Defaults to FALSE:
+// a board boots into IDLE.
+//
+// Caveat worth knowing: the backlog is IMPACT_BACKLOG_DEPTH deep and drops the
+// OLDEST record on overflow, so a long spell with delivery off keeps the most
+// recent 32 hits and loses the rest. That is the accepted trade for a mode whose
+// entire promise is that nothing goes out.
+void impact_det_set_delivery_enabled(bool on);
+bool impact_det_delivery_enabled(void);
+
 // Feed one sample at the full IMU rate. `h_mag` is the high-g resultant, which
 // the caller has already computed. Never gate this on link state or playback.
 void impact_det_feed(const lsm6_sample_t *s, float h_mag);

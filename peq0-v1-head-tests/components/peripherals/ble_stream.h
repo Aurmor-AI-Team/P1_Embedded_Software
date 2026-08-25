@@ -49,8 +49,27 @@ int ble_stream_meta_access(uint16_t conn, uint16_t attr,
 // GATT access callback for the Control characteristic. Accepts the receiver's
 // start/stop/restart grammar and ignores it — a wearable streams whenever a
 // client is subscribed — so the app can talk to either peer identically.
+//
+// It DOES act on "mode <idle|live|alerts|mock> [wid]", which is how a solo
+// session sets the working mode: the phone is connected straight to this board,
+// so there is no receiver to relay through. The optional trailing wid lets the
+// app send one identically-shaped string to either peer (the Pi needs it to
+// pick a board; we ignore one that isn't ours).
+//
+// MUST stay in sync with the same grammar in
+// rpi-receiver/ble-sender/ble_sender.py (control_write) and the app's
+// features/esp32-provisioning/wearableMode.ts.
 int ble_stream_control_access(uint16_t conn, uint16_t attr,
                               struct ble_gatt_access_ctxt *ctxt, void *arg);
+
+// Called when a client writes "mode <arg>", with everything after the verb.
+// Parsing the NAME is the callback's job, not this module's: the name<->enum
+// table belongs to app_ctrl, and peripherals must not include src/. Return
+// false for an unrecognised mode and the write is rejected, so a typo in the
+// app surfaces instead of silently doing nothing.
+//
+// Runs on the NimBLE host task: parse, post an event, return. Nothing heavy.
+void ble_stream_set_mode_cb(bool (*cb)(const char *arg));
 
 // Called from the GAP event handler when a client subscribes to / unsubscribes
 // from the Data characteristic. `data_handle` is that characteristic's value
@@ -69,6 +88,20 @@ void ble_stream_on_disconnect(void);
 // can decode the samples that are about to start. Lets a client subscribe and
 // authenticate in either order.
 void ble_stream_on_auth(uint16_t conn_handle);
+
+// Queue the decode tables to go out again ahead of the next frame.
+//
+// Call this whenever a working mode that STREAMS begins (see app_ctrl.h). Meta
+// used to be a subscribe-time affair only, which was safe when the board
+// streamed continuously: the first sample followed milliseconds later, so any
+// gap was invisible. With IDLE as the resting mode, minutes can pass between
+// subscribing and the first frame — long enough for the app to have missed,
+// dropped, or torn down and rebuilt the listener that was waiting for it. A
+// client that resumes without the tables silently discards every sample, which
+// looks exactly like a wearable that stopped sending.
+//
+// Cheap enough not to think about: ~640 bytes, once per mode change.
+void ble_stream_request_meta(void);
 
 // True once a client is connected, subscribed, AND allowed to read from us.
 // Re-evaluated on every send, so authenticating after subscribing just works.
