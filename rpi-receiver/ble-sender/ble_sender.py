@@ -34,6 +34,7 @@ import pose as pose_mod
 import protocol
 import replay
 import wifi_ap
+import udp_source
 from udp_source import UdpImuSource
 
 try:
@@ -181,8 +182,14 @@ class BleSender:
         offset = int(options.get("offset", 0))
         if offset == 0:
             active = self.source.active_wearables() if self.source else {}
+            modes = self.source.modes() if self.source else {}
             self._wearables_cache = json.dumps(
-                {"active": [{"wid": wid, "node": node}
+                # `mode` is what each board REPORTS, not what was commanded —
+                # a board reboots into idle, and its BOOT button can start a
+                # demo without anyone asking. None for a board that predates
+                # mode reporting.
+                {"active": [{"wid": wid, "node": node,
+                             "mode": modes.get(wid)}
                             for wid, node in sorted(active.items())]},
                 separators=(",", ":")).encode("utf-8")
         return list(self._wearables_cache[offset:])
@@ -210,6 +217,27 @@ class BleSender:
                                  daemon=True).start()
             else:
                 print("# control: 'forget' ignored (csv source)", file=sys.stderr)
+        elif parts and parts[0] == "mode":
+            # "mode <idle|live|alerts|mock> <wid>" — the app picked a working
+            # mode for a board that is on our WiFi (a group session), so it
+            # cannot write to that board's own control characteristic and asks
+            # us to relay. A solo session writes the SAME words straight to the
+            # wearable, which is why the grammar is shared.
+            #
+            # A wid is REQUIRED, for the same reason 'forget' needs one: one
+            # unauthenticated write must not be able to silence a whole team.
+            name = parts[1] if len(parts) > 1 else None
+            wid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+            if name not in udp_source.MODES:
+                print(f"# control: unknown mode {name!r} — ignored", file=sys.stderr)
+            elif wid is None:
+                print("# control: 'mode' needs a wearable id — ignored", file=sys.stderr)
+            elif self.source is not None:
+                # Retries sleep between sends — keep them off the GLib/BLE loop.
+                threading.Thread(target=self.source.send_mode, args=(wid, name),
+                                 daemon=True).start()
+            else:
+                print("# control: 'mode' ignored (csv source)", file=sys.stderr)
         if self.verbose:
             print(f"# control: {cmd!r}", file=sys.stderr)
 
@@ -250,7 +278,17 @@ class BleSender:
         self.frame_idx = 0
         self.running = True
         if self.source is not None:
-            self.source.drain()  # discard backlog accumulated while unsubscribed
+            # Discard the stale SAMPLE backlog accumulated while unsubscribed —
+            # nobody wants to watch minutes of old telemetry replay at catch-up
+            # speed. Impacts are the exception: they are sparse, each one is the
+            # reason this product exists, and the wearable already went to the
+            # trouble of retransmitting them until we acked. Put them back.
+            stale = self.source.drain()
+            held = [s for s in stale if s.get("type") == "impact"]
+            if held:
+                self.source.requeue(held)
+                print(f"# holding {len(held)} impact(s) buffered before subscribe",
+                      file=sys.stderr)
         # Always (re)send Meta first so a fresh subscriber — or a restart/loop —
         # can decode the samples that follow.
         self._send_meta()
@@ -348,10 +386,16 @@ class BleSender:
                 node_idx = self._ensure_node(sample["node"])
                 if node_idx is None:
                     continue  # node cap hit — drop rather than grow unbounded
-            layout = self.layouts[self.node_layout[node_idx]]
-            payload = protocol.encode_sample_binary(
-                sample, node_idx, layout, self.field_specs)
-            message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
+            if sample.get("type") == "impact":
+                # Fixed layout, no Meta lookup — stays decodable for a client
+                # that reconnected and has not re-read Meta yet.
+                payload = protocol.encode_impact_binary(sample, node_idx)
+                message = protocol.frame_record(protocol.MSG_IMPACT, payload)
+            else:
+                layout = self.layouts[self.node_layout[node_idx]]
+                payload = protocol.encode_sample_binary(
+                    sample, node_idx, layout, self.field_specs)
+                message = protocol.frame_record(protocol.MSG_SAMPLE, payload)
             for chunk in protocol.chunk_bytes(message, self.chunk_size):
                 self.data_char.set_value(list(chunk))
         if self.verbose:

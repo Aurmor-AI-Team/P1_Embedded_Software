@@ -8,7 +8,8 @@
 // Credentials, target, wearable ID, and expected Pi ID persist in NVS.
 //
 // All messages share a 4-byte header:
-//   uint8  msg_type   (1=IMU, 2=HELLO, 3=WELCOME, 4=FORGET)
+//   uint8  msg_type   (1=IMU, 2=HELLO, 3=WELCOME, 4=FORGET, 5=ALERT,
+//                      6=ALERT_ACK, 7=MODE, 8=MODE_RPT)
 //   uint8  version    (MSG_VERSION)
 //   uint16 wearable_id
 //
@@ -22,6 +23,17 @@
 //   "unpair": erase stored credentials and drop off the WiFi. Accepted only
 //   when the wearable_id targets us (or is 0) and pi_id matches the last
 //   WELCOME (or we have not verified a Pi yet).
+// MODE (9 bytes, Pi->wearable)    = header + uint32 pi_id + uint8 mode
+//   The working mode the app picked (wearable_mode_t), relayed by the receiver
+//   because a board on WiFi has its BLE off and cannot be written to directly.
+//   Same acceptance rules as FORGET. The solo-session equivalent is the
+//   "mode <name>" write on the stream service's Control characteristic.
+// MODE_RPT (5 bytes, wearable->Pi)= header + uint8 mode
+//   What we are ACTUALLY in, sent alongside every HELLO — the Pi cannot infer
+//   it, since we reboot into idle and the BOOT button can start a demo.
+//
+// This file must stay in sync with rpi-receiver/ble-sender/udp_source.py, which
+// carries the same structs and the same assertions.
 // ---------------------------------------------------------------------------
 #include "wifi_udp_tx.h"
 
@@ -62,11 +74,28 @@ static const char *TAG = "wifi_udp";
 #define SET_CONFIG_RETRIES   20
 #define SET_CONFIG_RETRY_MS  100
 
+// Version stays 1. We only ADD message types; the IMU packet layout is
+// untouched. udp_source.py drops any packet whose version != 1, so bumping this
+// would strand every board already in the field against an un-upgraded Pi and
+// vice versa.
 #define MSG_VERSION  1
 #define MSG_IMU      1
 #define MSG_HELLO    2
 #define MSG_WELCOME  3
 #define MSG_FORGET   4
+#define MSG_ALERT      5   // wearable -> Pi, one head impact. Acked.
+#define MSG_ALERT_ACK  6   // Pi -> wearable, echoes the alert seq
+#define MSG_MODE       7   // Pi -> wearable, set the working mode (app_ctrl.h)
+#define MSG_MODE_RPT   8   // wearable -> Pi, the mode we are actually in
+
+// Impacts are sparse and individually meaningful, so unlike IMU samples they
+// are retransmitted until acknowledged. The Pi MUST ack every alert — including
+// duplicates — or a board will keep resending one forever.
+#define ALERT_PENDING_MAX  8
+// Retry cadence is chosen against udp_rx_task's 500 ms SO_RCVTIMEO: the loop
+// wakes at least that often, so 600 ms fires exactly once per wake.
+#define ALERT_RETRY_MS     600
+#define ALERT_MAX_TRIES    6    // ~3.6 s of cover before we give up and log
 
 typedef struct __attribute__((packed)) {
     uint8_t  msg_type;
@@ -102,6 +131,55 @@ typedef struct __attribute__((packed)) {
     uint32_t pi_id;
 } forget_packet_t;
 
+// 34 bytes. Floats rather than scaled ints, matching imu_packet_t's style on
+// this link — the Pi rescales when it re-encodes for the phone.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint32_t seq;          // ack key, monotonic per boot
+    uint32_t t_ms;
+    float    peak_g;
+    float    threshold_g;
+    float    sum_g;
+    float    max_g;
+    uint32_t count;
+    uint16_t dur_ms;
+} alert_packet_t;
+
+// 8 bytes — comfortably inside udp_rx_task's 64-byte receive buffer.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint32_t seq;          // echoes the alert being acknowledged
+} alert_ack_packet_t;
+
+// 9 bytes — the working mode the app picked, relayed by the receiver to a board
+// it cannot reach over BLE (a group session: the board is on WiFi with its BLE
+// off). The solo equivalent is the "mode <name>" write on the stream service's
+// Control characteristic; both end up in app_ctrl as the same enum.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint32_t pi_id;
+    uint8_t  mode;         // wearable_mode_t
+} mode_packet_t;
+
+// 5 bytes — the mode we are ACTUALLY in, sent alongside every HELLO. The Pi
+// cannot infer this: a board reboots into IDLE, and the BOOT button can start a
+// demo without the app's involvement.
+//
+// This is a separate message rather than a field appended to HELLO on purpose.
+// udp_source.py matches HELLO on an EXACT length, so growing that packet would
+// make an un-upgraded receiver silently drop the handshake and the board would
+// never verify. An unknown msg_type, by contrast, falls through both sides'
+// dispatch harmlessly — so a new board works against an old Pi and vice versa.
+typedef struct __attribute__((packed)) {
+    msg_header_t hdr;
+    uint8_t  mode;         // wearable_mode_t
+} mode_report_packet_t;
+
+_Static_assert(sizeof(alert_packet_t) == 34, "alert_packet_t must match udp_source.py ALERT");
+_Static_assert(sizeof(alert_ack_packet_t) == 8, "alert_ack_packet_t must match udp_source.py ALERT_ACK");
+_Static_assert(sizeof(mode_packet_t) == 9, "mode_packet_t must match udp_source.py MODE");
+_Static_assert(sizeof(mode_report_packet_t) == 5, "mode_report_packet_t must match udp_source.py MODE_RPT");
+
 static volatile bool s_connected = false;
 static char          s_ip_str[16] = "0.0.0.0";
 static int           s_sock       = -1;
@@ -110,6 +188,16 @@ static volatile bool s_has_target = false;
 static portMUX_TYPE  s_lock       = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t      s_seq        = 0;   // touched only by the TX task
 static int           s_retry      = 0;
+
+// Alerts awaiting an ack. Guarded by s_lock; the sendto itself always happens
+// OUTSIDE the critical section.
+typedef struct {
+    alert_packet_t pkt;
+    int64_t        last_tx_us;
+    uint8_t        tries;
+    bool           used;
+} pending_alert_t;
+static pending_alert_t s_pending[ALERT_PENDING_MAX];
 
 static uint16_t      s_wearable_id     = 0;
 static uint16_t      s_default_wid     = 0;   // MAC-derived, restored on forget
@@ -120,6 +208,10 @@ static uint32_t      s_hello_nonce     = 0;
 static volatile bool s_has_creds       = false;
 static void (*s_forget_cb)(void)      = NULL;
 static void (*s_orphan_cb)(void)      = NULL;
+static void (*s_mode_cb)(uint8_t)     = NULL;
+// The working mode, mirrored here purely so send_hello() can report it. app_ctrl
+// owns it; this copy is write-only from our side.
+static volatile uint8_t s_wmode = 0;   // WMODE_IDLE
 
 // Orphan watchdog. s_last_link_ok_us is the last moment we were demonstrably
 // talking to our receiver; the watchdog in the rx task compares against it.
@@ -225,6 +317,15 @@ static void send_hello(void)
         .nonce = s_hello_nonce,
     };
     sendto(s_sock, &h, sizeof(h), 0, (struct sockaddr *)&dest, sizeof(dest));
+
+    // Piggyback the working mode on the same 2 s cadence. A board in ALERTS
+    // sends no telemetry for minutes at a time, so this is the receiver's only
+    // window into what it is doing.
+    mode_report_packet_t m = {
+        .hdr  = { MSG_MODE_RPT, MSG_VERSION, s_wearable_id },
+        .mode = s_wmode,
+    };
+    sendto(s_sock, &m, sizeof(m), 0, (struct sockaddr *)&dest, sizeof(dest));
 }
 
 static void handle_welcome(const welcome_packet_t *w)
@@ -280,6 +381,129 @@ static void link_watchdog(void)
     if (s_orphan_cb) s_orphan_cb();   // must only post an event
 }
 
+// ---------------------------------------------------------------------------
+// Reliable alerts
+// ---------------------------------------------------------------------------
+
+/** Clear a pending alert whose ack came back. Runs on the rx task. */
+static void handle_alert_ack(const alert_ack_packet_t *a)
+{
+    bool found = false;
+    portENTER_CRITICAL(&s_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        if (s_pending[i].used && s_pending[i].pkt.seq == a->seq) {
+            s_pending[i].used = false;
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (found) ESP_LOGI(TAG, "alert #%lu acked", (unsigned long)a->seq);
+}
+
+/** Resend anything unacked that is due. Runs on the rx task, every pass. */
+static void retry_pending_alerts(void)
+{
+    const int64_t now = esp_timer_get_time();
+
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        alert_packet_t pkt;
+        struct sockaddr_in dest;
+        bool due = false, give_up = false;
+
+        // Copy under the lock; never sendto() inside a critical section.
+        portENTER_CRITICAL(&s_lock);
+        if (s_pending[i].used && s_has_target &&
+                (now - s_pending[i].last_tx_us) >= (int64_t)ALERT_RETRY_MS * 1000) {
+            if (s_pending[i].tries >= ALERT_MAX_TRIES) {
+                s_pending[i].used = false;
+                give_up = true;
+                pkt = s_pending[i].pkt;
+            } else {
+                s_pending[i].tries++;
+                s_pending[i].last_tx_us = now;
+                pkt  = s_pending[i].pkt;
+                dest = s_dest;
+                due  = true;
+            }
+        }
+        portEXIT_CRITICAL(&s_lock);
+
+        if (give_up) {
+            ESP_LOGE(TAG, "alert #%lu (%.1f g) UNACKED after %d tries — giving up",
+                     (unsigned long)pkt.seq, (double)pkt.peak_g, ALERT_MAX_TRIES);
+        } else if (due) {
+            sendto(s_sock, &pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&dest, sizeof(dest));
+        }
+    }
+}
+
+esp_err_t wifi_udp_send_alert(const impact_rec_t *r)
+{
+    if (!r) return ESP_ERR_INVALID_ARG;
+    if (!s_connected) return ESP_ERR_INVALID_STATE;
+
+    struct sockaddr_in dest;
+    bool has;
+    portENTER_CRITICAL(&s_lock);
+    has = s_has_target;
+    if (has) dest = s_dest;
+    portEXIT_CRITICAL(&s_lock);
+    if (!has) return ESP_ERR_INVALID_STATE;
+
+    alert_packet_t pkt = {
+        .hdr         = { MSG_ALERT, MSG_VERSION, s_wearable_id },
+        .seq         = r->seq,
+        .t_ms        = r->t_ms,
+        .peak_g      = r->peak_g,
+        .threshold_g = r->threshold_g,
+        .sum_g       = r->sum_g,
+        .max_g       = r->max_g,
+        .count       = r->count,
+        .dur_ms      = r->dur_ms,
+    };
+
+    // Park it BEFORE the first send: an ack can race back before sendto()
+    // returns, and it needs a slot to match against or we'd retransmit an
+    // alert the Pi already has.
+    int slot = -1;
+    portENTER_CRITICAL(&s_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) {
+        if (!s_pending[i].used) {
+            s_pending[i].used       = true;
+            s_pending[i].tries      = 1;
+            s_pending[i].last_tx_us = esp_timer_get_time();
+            s_pending[i].pkt        = pkt;
+            slot = i;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+
+    // Table full: refuse, so the caller backlogs it instead of us dropping it.
+    if (slot < 0) return ESP_ERR_NO_MEM;
+
+    int n = sendto(s_sock, &pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&dest, sizeof(dest));
+    // A failed first send is not an error the caller should act on — the record
+    // is parked and the retry sweep will carry it.
+    if (n != (int)sizeof(pkt)) {
+        ESP_LOGW(TAG, "alert #%lu first send failed; queued for retry",
+                 (unsigned long)pkt.seq);
+    }
+    return ESP_OK;
+}
+
+uint8_t wifi_udp_alerts_pending(void)
+{
+    uint8_t n = 0;
+    portENTER_CRITICAL(&s_lock);
+    for (int i = 0; i < ALERT_PENDING_MAX; i++) if (s_pending[i].used) n++;
+    portEXIT_CRITICAL(&s_lock);
+    return n;
+}
+
 static void udp_rx_task(void *arg)
 {
     struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };  // 500 ms
@@ -292,6 +516,9 @@ static void udp_rx_task(void *arg)
         // Runs on EVERY pass, including the not-connected one below — being
         // off the network is precisely the case it exists to catch.
         link_watchdog();
+        // Harmless while the link is down (there is no target to send to), and
+        // this is the only periodic wake the alert table has.
+        retry_pending_alerts();
 
         if (!s_connected || !s_has_target) {
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -313,6 +540,12 @@ static void udp_rx_task(void *arg)
         msg_header_t *h = (msg_header_t *)buf;
         if (h->msg_type == MSG_WELCOME && n >= (int)sizeof(welcome_packet_t)) {
             handle_welcome((welcome_packet_t *)buf);
+        } else if (h->msg_type == MSG_ALERT_ACK && n >= (int)sizeof(alert_ack_packet_t)) {
+            alert_ack_packet_t *a = (alert_ack_packet_t *)buf;
+            if (a->hdr.version == MSG_VERSION &&
+                    (a->hdr.wearable_id == 0 || a->hdr.wearable_id == s_wearable_id)) {
+                handle_alert_ack(a);
+            }
         } else if (h->msg_type == MSG_FORGET && n >= (int)sizeof(forget_packet_t)) {
             forget_packet_t *f = (forget_packet_t *)buf;
             bool wid_ok = (f->hdr.wearable_id == 0 ||
@@ -322,6 +555,19 @@ static void udp_rx_task(void *arg)
                 ESP_LOGW(TAG, "FORGET from pi_id=%lu — unpairing",
                          (unsigned long)f->pi_id);
                 if (s_forget_cb) s_forget_cb();   // must only post an event
+            }
+        } else if (h->msg_type == MSG_MODE && n >= (int)sizeof(mode_packet_t)) {
+            // The app picked a working mode and the receiver relayed it. Same
+            // acceptance rules as FORGET: a stranger on the network must not be
+            // able to silence someone else's board.
+            mode_packet_t *m = (mode_packet_t *)buf;
+            bool wid_ok = (m->hdr.wearable_id == 0 ||
+                           m->hdr.wearable_id == s_wearable_id);
+            bool pi_ok  = (s_pi_id == 0 || m->pi_id == s_pi_id);
+            if (m->hdr.version == MSG_VERSION && wid_ok && pi_ok) {
+                ESP_LOGI(TAG, "MODE=%u from pi_id=%lu",
+                         m->mode, (unsigned long)m->pi_id);
+                if (s_mode_cb) s_mode_cb(m->mode);   // must only post an event
             }
         }
     }
@@ -471,6 +717,10 @@ esp_err_t wifi_udp_forget(void)
     portENTER_CRITICAL(&s_lock);
     s_has_target = false;
     s_last_welcome_us = 0;
+    // Pending alerts belong to the receiver we just left. Retransmitting them
+    // to whoever inherits that address would attribute one athlete's impacts
+    // to another session.
+    memset(s_pending, 0, sizeof(s_pending));
     portEXIT_CRITICAL(&s_lock);
     s_has_creds = false;   // stops the disconnect handler from reconnecting
     s_expected_pi_id = 0;
@@ -484,6 +734,8 @@ esp_err_t wifi_udp_forget(void)
 
 void wifi_udp_set_forget_cb(void (*cb)(void)) { s_forget_cb = cb; }
 void wifi_udp_set_orphan_cb(void (*cb)(void)) { s_orphan_cb = cb; }
+void wifi_udp_set_mode_cb(void (*cb)(uint8_t mode)) { s_mode_cb = cb; }
+void wifi_udp_set_reported_mode(uint8_t mode) { s_wmode = mode; }
 
 void wifi_udp_set_radio_policy(wifi_radio_policy_t policy)
 {

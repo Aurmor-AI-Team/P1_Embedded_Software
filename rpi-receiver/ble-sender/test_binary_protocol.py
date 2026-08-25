@@ -156,6 +156,34 @@ ESP32_SAMPLE_RECORD = bytes([
     0x00, 0x00,                           # ecg_rmssd_ms
 ])
 
+# The reference impact the byte fixture below encodes.
+#
+# Values are chosen to avoid an exact .5 tie after the x100 scaling. The C
+# encoder rounds half-AWAY-from-zero while Python's round() is banker's
+# rounding (round(2.5) == 2 in Python, 3 in C), so a value landing exactly on
+# .005 would encode differently on the two sides. Keep it that way.
+ESP32_IMPACT = {
+    "seq": 7, "t_ms": 1234567,
+    "peak_g": 41.23, "threshold_g": 20.0, "dur_ms": 18,
+    # Board-side running totals since ITS boot — loss detection, not display.
+    "count": 3, "max_g": 41.23, "sum_g": 88.41,
+}
+
+# One full MSG_IMPACT record as ble_stream.cpp puts it on the wire:
+# msg_type=4 | len=21 (0x0015 LE) | the fixed 21-byte impact layout.
+ESP32_IMPACT_RECORD = bytes([
+    0x04, 0x15, 0x00,                     # msg_type, length (u16 LE)
+    0x00,                                 # node_idx
+    0x07, 0x00,                           # seq = 7 (u16 LE)
+    0x87, 0xD6, 0x12, 0x00,               # t_ms = 1234567 (u32 LE)
+    0x1B, 0x10,                           # peak_g      41.23 * 100 = 4123
+    0xD0, 0x07,                           # threshold_g 20.0  * 100 = 2000
+    0x12, 0x00,                           # dur_ms = 18
+    0x03, 0x00,                           # count  = 3
+    0x1B, 0x10,                           # max_g       41.23 * 100 = 4123
+    0x89, 0x22, 0x00, 0x00,               # sum_g       88.41 * 100 = 8841 (u32)
+])
+
 
 # The enrolment challenge vector, shared with the other two repos.
 #
@@ -241,9 +269,73 @@ def check_esp32_stream_fixture() -> None:
           f"byte-identical to the Pi encoder)")
 
 
+def decode_impact(payload: bytes) -> dict:
+    """Reference MSG_IMPACT decoder — the third implementation of this layout,
+    alongside ble_stream.cpp's packer and the app's decodeImpact()."""
+    (node_idx, seq, t_ms, peak, thresh,
+     dur_ms, count, max_g, sum_g) = struct.unpack("<BHIHHHHHI", payload)
+    return {
+        "node_idx": node_idx, "seq": seq, "t_ms": t_ms,
+        "peak_g": peak / protocol.IMPACT_G_SCALE,
+        "threshold_g": thresh / protocol.IMPACT_G_SCALE,
+        "dur_ms": dur_ms, "count": count,
+        "max_g": max_g / protocol.IMPACT_G_SCALE,
+        "sum_g": sum_g / protocol.IMPACT_G_SCALE,
+    }
+
+
+def check_esp32_impact_fixture() -> None:
+    """The board's MSG_IMPACT bytes must be byte-identical to the Pi's.
+
+    A wearable reaches the phone two ways — straight over BLE in a solo session,
+    or relayed by the Pi in a group one — and the same hit must produce the same
+    bytes on both routes, or the app reads one of them wrong.
+    """
+    expected = protocol.frame_record(
+        protocol.MSG_IMPACT, protocol.encode_impact_binary(ESP32_IMPACT, 0))
+    assert ESP32_IMPACT_RECORD == expected, (
+        f"ESP32 impact bytes differ from the Pi encoder:\n"
+        f"  board: {ESP32_IMPACT_RECORD.hex(' ')}\n"
+        f"  pi:    {bytes(expected).hex(' ')}"
+    )
+
+    # An impact must survive reassembly at a hostile chunk boundary, and must
+    # NOT need Meta to decode — that is the whole point of the fixed layout.
+    stream = b"".join(protocol.chunk_bytes(ESP32_IMPACT_RECORD, 5))
+    (msg_type, body), = list(iter_records(stream))
+    assert msg_type == protocol.MSG_IMPACT, msg_type
+    decoded = decode_impact(body)
+    for key, want in ESP32_IMPACT.items():
+        got = decoded[key]
+        assert abs(float(got) - float(want)) <= 1e-6, f"{key}: {got} != {want}"
+    assert decoded["threshold_g"] == protocol.IMPACT_THRESHOLD_G, decoded["threshold_g"]
+    print(f"ESP32 impact fixture OK ({len(ESP32_IMPACT_RECORD)}B record, "
+          f"byte-identical to the Pi encoder)")
+
+
+def check_impact_leaves_live_meta_alone() -> None:
+    """Adding a record TYPE must not perturb the live sample layout.
+
+    MSG_IMPACT is deliberately absent from FIELD_SPECS. If someone ever adds it
+    there, the Meta descriptor changes, every deployed app decodes samples
+    against shifted offsets, and check_esp32_meta_fixture starts failing in a
+    way that is hard to trace back here.
+    """
+    for field in ("peak_g", "threshold_g", "dur_ms", "sum_g", "max_g"):
+        assert field not in protocol.FIELD_SPECS, (
+            f"{field!r} leaked into FIELD_SPECS — it would change the live "
+            f"sample layout and break every deployed decoder"
+        )
+    _, layouts, _ = protocol.build_live_protocol_meta(["AAAA"])
+    assert layouts == json.loads(ESP32_META_JSON)["layouts"], layouts
+    print("impact records leave the live sample layout untouched")
+
+
 def main() -> int:
     check_auth_challenge_fixture()
     check_esp32_meta_fixture()
+    check_esp32_impact_fixture()
+    check_impact_leaves_live_meta_alone()
     repo_root = __import__("pathlib").Path(__file__).resolve().parent.parent
     data_dir = repo_root / "mock-csv" / "10_pushups_biometric_data_simulation"
     frames, nodes = replay.load_frames(data_dir)

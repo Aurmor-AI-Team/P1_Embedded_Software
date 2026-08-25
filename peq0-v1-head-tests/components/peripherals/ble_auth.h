@@ -58,13 +58,19 @@ bool ble_auth_is_enrolled(void);
 // ble_auth_read_secret() succeeds; the secret is generated on first use.
 void ble_auth_open_window(uint32_t ms);
 
+// Close the window immediately. Called when a phone has taken the secret: the
+// press bought one claim, not `ms` of claimability, and the 2 Hz LED should
+// stop saying "claim me" the moment someone has.
+void ble_auth_close_window(void);
+
 // True while the enrolment window is open — drives the LED so the user can see
 // the board is claimable right now.
 bool ble_auth_window_open(void);
 
 // Copy the enrolment secret as lowercase hex into `out` (needs
 // AUTH_SECRET_BYTES*2+1 bytes). Fails unless the window is open. Generates and
-// persists the secret on first call.
+// persists the secret on first call, and closes the window on success — pairing
+// a second phone takes a second press.
 esp_err_t ble_auth_read_secret(char *out, size_t n);
 
 // Produce a fresh challenge as lowercase hex into `out` (needs

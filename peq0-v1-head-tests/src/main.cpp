@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
+#include "impact_det.h"
 #include "lsm6dsv.h"
 #include "wifi_udp_tx.h"
 #include "ble_provision.h"
@@ -57,7 +58,7 @@ static void imu_print_task(void *arg)
 
     printf("# t_ms      | ax        ay        az       | "
            "hx       hy       hz       | "
-           "gx        gy        gz        | temp | peak_h | all_peak | link\n");
+           "gx        gy        gz        | temp | peak_h | all_peak | imp | link\n");
 
     TickType_t next_print = xTaskGetTickCount() + pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS);
 
@@ -81,17 +82,37 @@ static void imu_print_task(void *arg)
 
         lsm6_sample_t s;
         if (xQueueReceive(s_imu_q, &s, wait_ticks) == pdTRUE) {
+            // The one gate for live telemetry: WMODE_LIVE, with mock playback
+            // stopped (it owns the wire while it runs, so the Pi never sees CSV
+            // rows and real samples interleaved). IDLE and ALERTS put nothing
+            // here — in ALERTS the only traffic is impact records, which is why
+            // the session screen simply updates less often rather than
+            // differently. Applies to BOTH transports: the mode is what the user
+            // picked, independent of which radio is carrying it.
+            const bool stream = app_ctrl_stream_enabled();
             if (++udp_decim >= UDP_DECIMATE) {
                 udp_decim = 0;
-                // Live sensor stream pauses while the mock CSV plays, so the
-                // Pi never sees the two interleaved.
-                if (!mock_playback_is_active()) wifi_udp_send_imu(&s);
+                if (stream) wifi_udp_send_imu(&s);
             }
             // Solo sessions read straight off the board over BLE instead of
             // going through the Pi. No-op unless a client is subscribed, and
             // internally rate-limited, so it is safe at the full sample rate.
-            if (!mock_playback_is_active()) ble_stream_notify(&s);
+            if (stream) ble_stream_notify(&s);
             float h_mag = sqrtf(s.hx_g * s.hx_g + s.hy_g * s.hy_g + s.hz_g * s.hz_g);
+            // Detection runs in EVERY state: during mock playback, with no radio
+            // up, unprovisioned. impact_det decides whether to send or hold.
+            // Never gate this on link state — a real hit with no receiver in
+            // range is still a real hit.
+#ifdef IMPACT_TEST_HOOK
+            // Demo builds ONLY: mock_playback also feeds the detector so the
+            // CSV's spliced impacts register, and the detector's arm/peak state
+            // is single-producer by design. Stand down while it plays rather
+            // than race it. Production keeps the unconditional feed below,
+            // where a real hit during a demo still counts.
+            if (!mock_playback_is_active()) impact_det_feed(&s, h_mag);
+#else
+            impact_det_feed(&s, h_mag);
+#endif
             if (!window_has_sample || h_mag > window_peak_g) {
                 window_peak_g      = h_mag;
                 window_peak_sample = s;
@@ -107,6 +128,10 @@ static void imu_print_task(void *arg)
         if ((int32_t)(xTaskGetTickCount() - next_print) > pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS)) {
             next_print = xTaskGetTickCount() + pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS);
         }
+
+        // Drain any impacts held while no transport was up, and close a window
+        // left half-open by a stalled sample stream.
+        impact_det_service();
 
         // Notify the app if connection or verification state changed.
         bool connected = wifi_udp_is_connected();
@@ -135,13 +160,14 @@ static void imu_print_task(void *arg)
         const lsm6_sample_t &p = window_peak_sample;
         printf("%-10lld | %+8.3f %+8.3f %+8.3f | "
                "%+8.2f %+8.2f %+8.2f | "
-               "%+9.2f %+9.2f %+9.2f | %5.1f | %5.2fg | %6.2fg  | %s\n",
+               "%+9.2f %+9.2f %+9.2f | %5.1f | %5.2fg | %6.2fg  | %3lu | %s\n",
                now_ms,
                p.ax_g, p.ay_g, p.az_g,
                p.hx_g, p.hy_g, p.hz_g,
                p.gx_dps, p.gy_dps, p.gz_dps,
                p.temp_c,
-               window_peak_g, all_time_peak_g, link);
+               window_peak_g, all_time_peak_g,
+               (unsigned long)impact_det_count(), link);
 
         window_peak_g     = 0.0f;
         window_has_sample = false;
@@ -201,6 +227,22 @@ extern "C" void app_main(void)
     // BLE stays off until a 3 s BOOT long-press enters pairing mode.
     if (app_ctrl_init() != ESP_OK) {
         ESP_LOGE(TAG, "app_ctrl init failed");   // not fatal
+    }
+
+    // --- Impact detection ---
+    impact_det_init();
+#ifdef IMPACT_TEST_HOOK
+    // Say it at boot, every boot. A build where fabricated impacts are
+    // indistinguishable from an athlete's real ones must never reach a field
+    // unnoticed, and a compile flag is easy to forget.
+    ESP_LOGE(TAG, "*** IMPACT_TEST_HOOK BUILD — synthetic impacts are ENABLED ***");
+    ESP_LOGE(TAG, "*** Mock playback emits fake head impacts. DO NOT SHIP.  ***");
+#endif
+    if (!imu_ok) {
+        // Say this loudly. A head sensor that silently stopped counting impacts
+        // looks exactly like one that saw none, and that is the worst way for
+        // this product to fail.
+        ESP_LOGE(TAG, "NO IMU — HEAD IMPACT DETECTION IS INOPERATIVE");
     }
 
     // --- IMU sample queue + timer (live stream only; skipped without a sensor) ---
