@@ -753,7 +753,12 @@ def main_udp(args) -> None:
     if args.pi_id is not None:
         cfg["pi_id"] = args.pi_id
     if not args.no_ap:
-        wifi_ap.ensure_ap(cfg)
+        # Only a SUCCESSFUL ensure_ap ends first-boot. If it failed, the
+        # environment is still incomplete and the next boot's ExecStartPre gate
+        # must stay lenient — otherwise a clone whose first AP build hiccupped
+        # is bricked by the very check meant to protect it.
+        if wifi_ap.ensure_ap(cfg):
+            wifi_ap.clear_first_boot_marker()
 
     source = UdpImuSource(cfg["udp_port"], cfg["pi_id"], verbose=args.verbose)
     source.start()

@@ -22,6 +22,41 @@ AP_IP = "10.42.0.1"
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "receiver_config.json"
 
+# Written by tools/prepare-image.sh, cleared the first time a config is loaded.
+#
+# Its only job is to let the self-test tell "this clone has never booted" (fine,
+# expected, the service is about to mint an identity) apart from "this receiver
+# LOST its identity" (alarming, stop and restore from backup). Those two states
+# are identical on disk, and conflating them breaks one way or the other:
+# treating both as fatal deadlocks every fresh clone at the ExecStartPre gate in
+# aurmor-receiver.service — the gate fails, ExecStart never runs, so nothing
+# ever creates the file the gate is waiting for — while treating both as benign
+# silently regenerates an identity after a real loss.
+FIRST_BOOT_MARKER = Path("/var/lib/aurmor/first-boot")
+
+
+def first_boot_pending() -> bool:
+    """True on a clone that was imaged but has not yet minted its identity."""
+    try:
+        return FIRST_BOOT_MARKER.exists()
+    except OSError:  # unreadable /var/lib is not our problem to diagnose
+        return False
+
+
+def clear_first_boot_marker() -> None:
+    """Called by the receiver once the environment is genuinely complete —
+    identity minted AND access point up. Deliberately NOT called from
+    load_config: a config alone is not a working receiver, and clearing on that
+    alone would re-arm the ExecStartPre deadlock for any clone whose first
+    ensure_ap() failed. Never fatal; the worst case is one more lenient
+    self-test."""
+    try:
+        FIRST_BOOT_MARKER.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # noqa: BLE001 - advisory only
+        print(f"# could not clear {FIRST_BOOT_MARKER}: {exc}", file=sys.stderr)
+
 # The old shared default. Several receivers side by side must NOT share an SSID
 # (the ESP32 would treat them as one roaming network and pick by signal, not
 # identity), so a config still carrying this literal is migrated to a unique one.

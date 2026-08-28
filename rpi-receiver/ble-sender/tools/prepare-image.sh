@@ -136,6 +136,16 @@ if (( ${#strays[@]} )); then
     echo
 fi
 
+echo "==> Marking first boot"
+# Without this the strip and the start gate deadlock: aurmor-receiver.service
+# runs --selftest as ExecStartPre, the self-test FAILs on the missing config we
+# just deleted, systemd therefore never runs ExecStart, and ExecStart is the
+# only thing that would have created that config. The clone boots, retries ten
+# times, and parks in 'failed' with no AP and no BLE. The marker tells the
+# self-test this absence is expected exactly once.
+install -d /var/lib/aurmor
+: > /var/lib/aurmor/first-boot
+
 echo "==> Removing the AP profile"
 # Carries the old SSID and password; the real service rebuilds it from the fresh
 # config on first boot. (A mock image simply never brings one up.)
@@ -215,6 +225,12 @@ if [[ -e $BLE_DIR/receiver_config.json ]]; then
     fail=1
 else
     printf '    [PASS] %-32s removed\n' "receiver_config.json"
+fi
+if [[ -e /var/lib/aurmor/first-boot ]]; then
+    printf '    [PASS] %-32s present\n' "first-boot marker"
+else
+    echo "    [FAIL] first-boot marker missing — clones would deadlock at ExecStartPre"
+    fail=1
 fi
 (( fail == 0 )) || { echo; echo "!!  NOT ready to image — fix the FAILs above." >&2; exit 1; }
 
