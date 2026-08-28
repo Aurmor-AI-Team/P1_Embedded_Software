@@ -89,6 +89,14 @@ def _check_privileges(rep: Report, con: str) -> None:
 
 def _check_config(rep: Report, cfg_path: Path) -> dict | None:
     if not cfg_path.exists():
+        if wifi_ap.first_boot_pending():
+            # A stripped image, booting for the first time. The service mints
+            # the identity in ExecStart — which never happens if this returns
+            # FAIL, because the unit gates ExecStart on this very check.
+            rep.add(WARN, "receiver identity",
+                    f"{cfg_path} not created yet — first boot after imaging; "
+                    f"the service generates one on start.")
+            return None
         rep.add(FAIL, "receiver identity",
                 f"{cfg_path} missing — starting the service now would mint a "
                 f"NEW identity\n        (new password + pi_id), orphaning every "
@@ -108,6 +116,11 @@ def _check_ap(rep: Report, cfg: dict) -> None:
     con = cfg["ap_con_name"]
     listing = _run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
     if con not in listing.stdout.splitlines():
+        if wifi_ap.first_boot_pending():
+            rep.add(WARN, "AP profile",
+                    f"'{con}' not built yet — first boot after imaging; "
+                    f"the service creates it from the config on start.")
+            return
         rep.add(FAIL, "AP profile",
                 f"'{con}' does not exist — wearables get NO_AP_FOUND.\n"
                 f"        Fix: sudo systemctl restart the service with "
