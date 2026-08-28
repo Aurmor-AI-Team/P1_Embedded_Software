@@ -150,7 +150,40 @@ def run_source_tests() -> int:
     assert protocol.presence_manufacturer_data([1]) == [2, 1, 1, 0]
     assert protocol.presence_manufacturer_data([0x5AF3]) == [2, 1, 0xF3, 0x5A]
     assert protocol.presence_manufacturer_data([2, 1]) == [2, 2, 1, 0, 2, 0]  # sorted
-    print("presence manufacturer data OK")
+
+    # THE SIZE RULE, and the reason it is asserted rather than trusted: the
+    # presence data shares one 31-byte legacy advertisement with Flags and the
+    # 128-bit service UUID. Exceed it and BlueZ refuses to register the
+    # advertisement AT ALL — the receiver then advertises nothing, and every
+    # scan in the app (device picker, presence, session connect) stops seeing
+    # it. That is how a "cap" of 10 turned into "a group session cannot find its
+    # receiver". Any future change to the advertisement contents must move
+    # _ADV_FIXED_BYTES with it.
+    for count in (0, 1, 2, 3, 10, 64):
+        window = protocol.presence_window(range(0xE001, 0xE001 + count), 0)
+        payload = protocol.presence_manufacturer_data(window)
+        advertised = protocol._ADV_FIXED_BYTES - 2 + len(payload)
+        assert advertised <= protocol.ADV_PAYLOAD_BYTES, \
+            f"{count} wids -> {advertised} B advertisement (over 31)"
+        assert payload[1] == min(count, protocol.PRESENCE_MAX_WIDS), payload
+
+    # A fleet larger than one advertisement is broadcast a slice at a time, and
+    # the rotation must COVER every board — the app holds each one present for
+    # PRESENCE_TTL_MS, far longer than a full cycle takes.
+    fleet = list(range(0xE001, 0xE001 + 10))
+    slices = -(-len(fleet) // protocol.PRESENCE_MAX_WIDS)
+    seen = set()
+    for offset in range(slices):
+        seen.update(protocol.presence_window(fleet, offset))
+    assert seen == set(fleet), f"rotation misses {set(fleet) - seen}"
+    # And it wraps rather than running short or repeating a partial window.
+    assert protocol.presence_window(fleet, slices) == \
+        protocol.presence_window(fleet, 0), "rotation must wrap cleanly"
+    for offset in range(slices * 3):
+        assert len(protocol.presence_window(fleet, offset)) == protocol.PRESENCE_MAX_WIDS
+    # A fleet that already fits is never rotated (nothing to hide).
+    assert protocol.presence_window([5, 3], 7) == [3, 5]
+    print("presence manufacturer data + advertisement size budget OK")
 
     # FORGET goes to the wid's last-seen address with our pi_id.
     assert src.send_forget(1, retries=2, interval_s=0.01) is True

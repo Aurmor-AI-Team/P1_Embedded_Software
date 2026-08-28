@@ -42,21 +42,65 @@ SCHEMA_VERSION = 2               # 2 = binary-v1 framing (was 1 = NDJSON)
 # are 16-bit, so the list form replaces it.)
 PRESENCE_MFG_ID = 0xFFFF
 PRESENCE_VERSION = 2
-# Cap so the manufacturer data fits a single BLE advertisement (company id +
-# [version, count] + 2 bytes/wid). 10 wids => 24 bytes, within the ~29-byte
-# manufacturer-data budget of a legacy advertisement.
-PRESENCE_MAX_WIDS = 10
+
+# The presence data does NOT have the advertisement to itself, and it is the part
+# that has to yield: BlueZ refuses to register an advertisement whose AD
+# structures exceed 31 bytes, and a receiver that cannot advertise is invisible
+# to every scan in the app — the device picker, the presence scan and the session
+# connection alike. Losing a few wids off the presence list costs a badge;
+# losing the advertisement costs the whole product.
+#
+# What else is in those 31 bytes, and why:
+#      3 B  Flags
+#     18 B  Complete 128-bit Service UUID list (1 len + 1 type + SERVICE_UUID)
+#      4 B  manufacturer-data AD header (1 len + 1 type + 2 company id)
+#      2 B  our [version, count]
+#   = 27 B, leaving 4 B -> TWO wids per advertisement.
+#
+# This was hardcoded to 10 until 2026-08-27, on the assumption that the ~29-byte
+# manufacturer-data budget was ours alone. It is not, and the result was that a
+# receiver with THREE OR MORE live wearables stopped advertising entirely — the
+# exact group-session case the presence broadcast exists to serve. Boards beyond
+# the cap are covered by rotating which ones are named (see _refresh_presence_adv
+# in ble_sender.py): the app's presence TTL is far longer than the refresh
+# interval, so a whole fleet still reads as present.
+ADV_PAYLOAD_BYTES = 31
+_ADV_FIXED_BYTES = 3 + 18 + 4 + 2
+PRESENCE_MAX_WIDS = (ADV_PAYLOAD_BYTES - _ADV_FIXED_BYTES) // 2
 
 
 def presence_manufacturer_data(active_wids) -> list:
     """Payload bytes ([version, count, wid0_lo, wid0_hi, …]) for the presence
-    advertisement — an explicit u16-LE list of live wids."""
+    advertisement — an explicit u16-LE list of live wids.
+
+    At most PRESENCE_MAX_WIDS are named; pass an already-rotated window (see
+    presence_window) when there are more live wearables than fit.
+    """
     wids = sorted({int(w) & 0xFFFF for w in active_wids})[:PRESENCE_MAX_WIDS]
     out = [PRESENCE_VERSION, len(wids)]
     for wid in wids:
         out.append(wid & 0xFF)
         out.append((wid >> 8) & 0xFF)
     return out
+
+
+def presence_window(active_wids, offset: int) -> list:
+    """The ``offset``-th slice of live wids to name in one advertisement.
+
+    Only PRESENCE_MAX_WIDS fit at a time, so a larger fleet is broadcast a slice
+    at a time and the caller advances ``offset`` on each refresh. Wrapping is
+    what keeps every board within the app's presence TTL: the refresh interval
+    times the number of slices must stay under it, or a board ages out between
+    its turns.
+    """
+    wids = sorted({int(w) & 0xFFFF for w in active_wids})
+    if len(wids) <= PRESENCE_MAX_WIDS:
+        return wids
+    start = (offset * PRESENCE_MAX_WIDS) % len(wids)
+    window = wids[start:start + PRESENCE_MAX_WIDS]
+    if len(window) < PRESENCE_MAX_WIDS:      # wrapped past the end
+        window += wids[:PRESENCE_MAX_WIDS - len(window)]
+    return window
 
 # Constant / redundant columns dropped from each sample to save BLE bytes.
 _DROP_COLUMNS = {"timestamp_iso", "label", "version", "present_mask_hex"}

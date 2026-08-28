@@ -1,0 +1,46 @@
+# The receiver running a fleet of EMULATED wearables, for testing a group
+# session without ten physical boards. Installed by tools/install.sh but NOT
+# enabled — this is a deliberate, temporary swap:
+#
+#   sudo systemctl stop aurmor-receiver
+#   sudo systemctl start aurmor-receiver-mock
+#   …test…
+#   sudo systemctl stop aurmor-receiver-mock
+#   sudo systemctl start aurmor-receiver
+#
+# The app side is the "Use mock wearables" toggle on the New Group Session
+# screen. Both halves are needed: the toggle invents the devices, this invents
+# their data.
+[Unit]
+Description=Aurmor receiver (MOCK) — BLE GATT server with emulated wearables
+After=NetworkManager.service bluetooth.service network-online.target
+Wants=NetworkManager.service bluetooth.service
+# Mutually exclusive with the real receiver: both claim the Bluetooth adapter
+# and the same UDP port, and two GATT servers advertising one receiver_name is
+# a debugging nightmare nobody should be able to create by accident.
+Conflicts=aurmor-receiver.service
+
+[Service]
+Type=simple
+# Same reason as the real unit: without this, systemd block-buffers stdout and
+# startup messages arrive minutes late, reading as "it never ran".
+Environment=PYTHONUNBUFFERED=1
+# Root for consistency with aurmor-receiver (it owns the same BlueZ adapter
+# alias). This unit does NOT bring up the access point — no emulated board needs
+# it — so it touches NetworkManager only if started by hand with --ap.
+User=root
+
+WorkingDirectory=/opt/aurmor/ble-sender
+ExecStart=/opt/aurmor/venv/bin/python /opt/aurmor/ble-sender/mock_receiver.py
+
+# Deliberately NO --selftest ExecStartPre. The selftest validates the AP profile
+# and its security pinning, which this mode does not use; failing on it would
+# block the one configuration that needs no wearables to work.
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

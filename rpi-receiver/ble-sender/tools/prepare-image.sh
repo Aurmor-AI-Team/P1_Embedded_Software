@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Strip this Pi's IDENTITY so the SD card can be imaged for other people.
+# Strip this Pi's IDENTITY and choose which receiver a clone boots into, so the
+# SD card can be imaged for other people.
 #
-#   sudo ./tools/prepare-image.sh     # then shut down and capture the card
+#   sudo ./tools/prepare-image.sh                 # real receiver (default)
+#   sudo ./tools/prepare-image.sh --mode mock     # emulated-wearable receiver
+#
+# Or use the wrappers, which say the same thing more legibly:
+#   sudo ./tools/image-real.sh
+#   sudo ./tools/image-mock.sh
 #
 # A receiver's identity is not just a name. It is the hidden SSID, the AP
 # password and the pi_id that wearables verify against — all generated once, on
@@ -12,22 +18,64 @@
 # by name, and names would collide too).
 #
 # Each Pi regenerates its own identity on next boot, deriving the suffix from its
-# own board serial, so a stripped image is self-configuring.
+# own board serial, so a stripped image is self-configuring. Both modes need
+# this: mock_receiver.py calls wifi_ap.load_config() exactly like the real one.
 set -euo pipefail
+
+REAL_UNIT=aurmor-receiver.service
+MOCK_UNIT=aurmor-receiver-mock.service
+# The hand-written unit that predates tools/install.sh. Left enabled alongside
+# the real one it would give a clone two GATT servers on one adapter and two
+# binders on UDP 5005 — so imaging retires it rather than tolerating it.
+LEGACY_UNIT=ble_sender.service
+
+MODE=real
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --mode)   MODE="${2:-}"; shift 2 ;;
+        --mode=*) MODE="${1#*=}"; shift ;;
+        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+case $MODE in
+    real) WANTED=$REAL_UNIT; UNWANTED=$MOCK_UNIT
+          BLURB="the REAL receiver — streams from physical ESP32 wearables over the hidden AP" ;;
+    mock) WANTED=$MOCK_UNIT; UNWANTED=$REAL_UNIT
+          BLURB="the MOCK receiver — ten EMULATED wearables, no boards and no AP needed" ;;
+    *) echo "--mode must be 'real' or 'mock' (got '${MODE}')" >&2; exit 2 ;;
+esac
 
 # Where ble-sender actually lives. Auto-detects the two layouts in use — the
 # install.sh one and a hand-deployed home directory — so this can't silently
 # "strip" an identity file it never found and hand you an image that still
 # carries one. Override with AURMOR_DIR=... if yours is elsewhere.
-UNIT=aurmor-receiver.service
 for candidate in "${AURMOR_DIR:-}" /opt/aurmor/ble-sender \
                  /home/*/rpi-receiver/ble-sender ~/rpi-receiver/ble-sender; do
     [[ -n $candidate && -d $candidate ]] && { BLE_DIR="$candidate"; break; }
 done
 : "${BLE_DIR:?could not find ble-sender; set AURMOR_DIR=/path/to/ble-sender}"
-echo "==> Using $BLE_DIR"
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+
+echo "==> Using $BLE_DIR"
+echo "==> Mode: $MODE — clones will boot $BLURB"
+
+# Both units must exist before we can pick one. Without this check a Pi that
+# never ran install.sh would strip happily, enable nothing, and produce an image
+# whose clones boot into no receiver at all.
+missing=()
+for u in "$REAL_UNIT" "$MOCK_UNIT"; do
+    [[ -f "/etc/systemd/system/$u" ]] || missing+=("$u")
+done
+if (( ${#missing[@]} )); then
+    echo >&2
+    echo "!!  Not installed: ${missing[*]}" >&2
+    echo "!!  Run 'sudo ./tools/install.sh' first — otherwise this script cannot" >&2
+    echo "!!  choose which receiver the image boots into." >&2
+    exit 1
+fi
 
 if [[ -f "$BLE_DIR/receiver_config.json" ]]; then
     echo
@@ -42,17 +90,55 @@ if [[ -f "$BLE_DIR/receiver_config.json" ]]; then
 fi
 
 echo "==> Stopping services"
-systemctl stop "$UNIT" ble_sender.service 2>/dev/null || true
+# The mock is in this list deliberately: mock_receiver.py calls load_config(),
+# so a mock left running would regenerate receiver_config.json seconds after the
+# strip deletes it, and the image would ship this Pi's identity after all.
+systemctl stop "$REAL_UNIT" "$MOCK_UNIT" "$LEGACY_UNIT" 2>/dev/null || true
 systemctl stop aurmor-wifi-evict.service 2>/dev/null || true
+
+echo "==> Retiring the hand-written $LEGACY_UNIT, if present"
+if [[ -f "/etc/systemd/system/$LEGACY_UNIT" ]]; then
+    systemctl disable "$LEGACY_UNIT" 2>/dev/null || true
+    install -d /var/backups
+    mv -v "/etc/systemd/system/$LEGACY_UNIT" \
+          "/var/backups/$LEGACY_UNIT.retired-$(date +%Y%m%d%H%M%S)"
+    rm -rf "/etc/systemd/system/$LEGACY_UNIT.d"
+    systemctl daemon-reload
+else
+    echo "    not present"
+fi
+
+echo "==> Selecting the boot receiver"
+# Exactly one. Conflicts= in the units stops them running together, but only an
+# enable/disable pair decides which one a clone comes up in.
+systemctl disable "$UNWANTED" 2>/dev/null || true
+systemctl enable "$WANTED"
 
 echo "==> Removing this Pi's receiver identity"
 # SSID + AP password + pi_id + receiver_name. The .bak too — it is the same
 # identity, and shipping it would let a clone "restore" someone else's.
 rm -fv "$BLE_DIR/receiver_config.json" "$BLE_DIR/receiver_config.json.bak"
 
+# Copies outside the install dir are NOT deleted: one of them is usually the
+# operator's own restore point, and destroying that is how a working Pi gets
+# lost. They are inert (nothing reads them automatically) but they do carry this
+# Pi's identity into the image, so name them and let a human decide.
+strays=()
+while IFS= read -r -d '' f; do strays+=("$f"); done < <(
+    find /home /root -maxdepth 6 -name 'receiver_config*' \
+         -not -path "$BLE_DIR/*" -print0 2>/dev/null || true)
+if (( ${#strays[@]} )); then
+    echo
+    echo "!!  Other copies of a receiver identity are still on this card:"
+    printf '!!    %s\n' "${strays[@]}"
+    echo "!!  They are inert — nothing loads them automatically — but they do"
+    echo "!!  ship in the image. Delete them yourself if that matters to you."
+    echo
+fi
+
 echo "==> Removing the AP profile"
-# Carries the old SSID and password; the service rebuilds it from the fresh
-# config on first boot.
+# Carries the old SSID and password; the real service rebuilds it from the fresh
+# config on first boot. (A mock image simply never brings one up.)
 nmcli connection delete aurmor-ap 2>/dev/null || true
 
 echo "==> Removing Bluetooth identity + bonds"
@@ -111,21 +197,70 @@ rm -f /var/lib/dbus/machine-id 2>/dev/null || true
 # WiFi password they typed while debugging).
 rm -f /root/.bash_history /home/*/.bash_history 2>/dev/null || true
 
-cat <<'EOF'
+echo
+echo "==> Verification"
+fail=0
+for u in "$WANTED" "$UNWANTED"; do
+    state="$(systemctl is-enabled "$u" 2>&1 || true)"
+    want=enabled; [[ $u == "$UNWANTED" ]] && want=disabled
+    if [[ $state == "$want" ]]; then
+        printf '    [PASS] %-32s %s\n' "$u" "$state"
+    else
+        printf '    [FAIL] %-32s %s (expected %s)\n' "$u" "$state" "$want"
+        fail=1
+    fi
+done
+if [[ -e $BLE_DIR/receiver_config.json ]]; then
+    echo "    [FAIL] receiver_config.json still present — something regenerated it"
+    fail=1
+else
+    printf '    [PASS] %-32s removed\n' "receiver_config.json"
+fi
+(( fail == 0 )) || { echo; echo "!!  NOT ready to image — fix the FAILs above." >&2; exit 1; }
 
-Ready to image. Now:
+SUGGESTED="aurmor-rpi-$(date +%Y%m%d)-${MODE}.img.gz"
+cat <<EOF
 
-  sudo shutdown -h now      # then capture the card
+Ready to image ($MODE). Now:
+
+  sudo shutdown -h now      # then capture the card, and do NOT boot it again
+
+Capture (from a Mac, card as /dev/diskN — check with 'diskutil list'):
+
+  diskutil unmountDisk /dev/diskN
+  sudo dd if=/dev/rdiskN bs=4m | pigz -c > $SUGGESTED
+  pigz -t $SUGGESTED && shasum -a 256 $SUGGESTED | tee $SUGGESTED.sha256
+
+Booting the card again regenerates an identity and makes it dirty: re-run this
+script before capturing if that happens.
 
 On first boot each clone will:
-  * generate its own receiver_config.json (SSID/password/pi_id from ITS board serial)
-  * build its own aurmor-ap profile from that config
+  * generate its own receiver_config.json (identity from ITS board serial)
+  * start $WANTED
   * regenerate SSH host keys and machine-id
+EOF
+
+if [[ $MODE == real ]]; then
+cat <<EOF
+  * build its own aurmor-ap profile from that config
 
 Verify on a fresh clone before handing it over:
-  sudo systemctl status aurmor-receiver
+  sudo systemctl status ${WANTED%.service}
   /opt/aurmor/venv/bin/python /opt/aurmor/ble-sender/ble_sender.py --selftest
 
 The self-test must print all PASS. If it does not, the clone is broken in one of
 the ways that otherwise only shows up as "the app can't see my wearable".
 EOF
+else
+cat <<EOF
+
+This image brings up NO WiFi access point — emulated boards talk over loopback,
+so there is nothing for a physical wearable to join. Pair it with the app's
+"Use mock wearables" toggle on the New Group Session screen; both halves are
+needed.
+
+Verify on a fresh clone before handing it over:
+  sudo systemctl status ${WANTED%.service}
+  journalctl -u $WANTED -b | grep -i "mock\|presence"
+EOF
+fi
