@@ -37,6 +37,12 @@ import wifi_ap
 import udp_source
 from udp_source import UdpImuSource
 
+# How often the presence advertisement is re-registered. Also paces the wid
+# rotation when a fleet is larger than one advertisement holds: this interval
+# times the number of slices must stay well under the app's PRESENCE_TTL_MS
+# (25 s in useKnownDeviceScan.ts), or a board ages out between its turns.
+PRESENCE_REFRESH_MS = 4000
+
 try:
     import pairing_agent
 except ImportError:  # pragma: no cover - deployment skew only
@@ -149,6 +155,12 @@ class BleSender:
         self._wearables_cache = b'{"active":[]}'
         self._periph = None
         self._last_presence = None
+        # Which slice of the live wids the advertisement is currently naming.
+        self._presence_offset = 0
+        # Broadcasting presence is optional: mock_receiver.py turns it off
+        # because the app already knows its simulated fleet, and there is no
+        # point spending advertisement bytes to tell it what it invented.
+        self.presence_adv_enabled = True
 
         self.data_char = None
         self.frame_idx = 0
@@ -558,7 +570,7 @@ class BleSender:
         # Broadcast live-wearable presence in the advertisement (live mode only)
         # so the app shows a BLE-silent ESP32 as detected without connecting.
         self._periph = periph
-        if self.source is not None:
+        if self.source is not None and self.presence_adv_enabled:
             self._arm_presence_adv()
 
         trigger = (f"press {self._trigger_desc()}" if self.use_button
@@ -572,11 +584,27 @@ class BleSender:
             periph.publish()
         except KeyboardInterrupt:
             print("\nStopped.")
+        except Exception as exc:  # noqa: BLE001 - see _publish_without_presence
+            # Most likely an advertisement BlueZ rejected (it caps the AD
+            # structures at 31 bytes). Say so plainly — the symptom is "the app
+            # cannot see the receiver at all", which points nowhere near here —
+            # then drop the presence data and try again.
+            print(f"# publish failed ({exc}); retrying WITHOUT the presence "
+                  f"broadcast. Wearables will show as not detected until they "
+                  f"connect, but the receiver will be visible.", file=sys.stderr)
+            try:
+                self._publish_without_presence(periph)
+            except KeyboardInterrupt:
+                print("\nStopped.")
 
     # -- presence advertisement --------------------------------------------- #
     def _presence_data(self):
         active = self.source.active_wearables() if self.source else {}
-        return protocol.presence_manufacturer_data(active.keys())
+        # Only PRESENCE_MAX_WIDS fit alongside the service UUID, so a bigger
+        # fleet is named a slice at a time; the app's PRESENCE_TTL_MS (25 s) is
+        # long enough that every board stays "detected" between its turns.
+        window = protocol.presence_window(active.keys(), self._presence_offset)
+        return protocol.presence_manufacturer_data(window)
 
     @staticmethod
     def _set_mfg_data(advert, mid, data):
@@ -601,10 +629,13 @@ class BleSender:
             return
         self._last_presence = self._presence_data()
         add_timer = getattr(self._async, 'add_timer_ms', None) or self._async.add_timeout
-        add_timer(4000, self._refresh_presence_adv)
+        add_timer(PRESENCE_REFRESH_MS, self._refresh_presence_adv)
         print("# presence-adv: broadcasting live-wearable presence", file=sys.stderr)
 
     def _refresh_presence_adv(self):
+        # Advance the rotation first: with more live wearables than fit one
+        # advertisement, the payload only changes because the window moved.
+        self._presence_offset += 1
         data = self._presence_data()
         if data != self._last_presence:
             try:
@@ -617,6 +648,23 @@ class BleSender:
                 print(f"# presence-adv: refresh failed ({exc})", file=sys.stderr)
                 return False  # stop the timer; stale presence is better than churn
         return True
+
+    def _publish_without_presence(self, periph):
+        """Re-publish with the presence data stripped.
+
+        The last-resort recovery from an advertisement BlueZ won't accept. A
+        receiver that does not advertise is invisible to EVERY scan in the app —
+        the device picker, the presence scan and the session connection — so
+        losing the presence badge is always the better trade. The sizing is
+        computed (protocol.PRESENCE_MAX_WIDS), so this should be unreachable;
+        it exists because the failure mode it guards against is total and its
+        cause is not obvious from the symptom.
+        """
+        try:
+            self._set_mfg_data(periph.advert, protocol.PRESENCE_MFG_ID, [])
+        except Exception:  # noqa: BLE001 - about to try publishing regardless
+            pass
+        periph.publish()
 
 
 def parse_args(argv=None):

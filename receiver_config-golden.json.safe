@@ -1,0 +1,10 @@
+{
+  "ap_con_name": "aurmor-ap",
+  "ap_ifname": "wlan0",
+  "ap_channel": 6,
+  "udp_port": 5005,
+  "ap_ssid": "aurmor-pi-f141",
+  "receiver_name": "aurmor-rpi-f141",
+  "ap_password": "H8q13fSkWoW_",
+  "pi_id": 158270986
+}

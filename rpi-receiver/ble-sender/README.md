@@ -242,6 +242,87 @@ Needs gpiozero (preinstalled on Raspberry Pi OS; else
 `sudo apt install python3-gpiozero python3-lgpio`). Button wired to **3V3**
 instead of GND? Change `pull_up=True` to `False` in `_arm_gpio_button`.
 
+## Mock mode: a group session without ten wearables
+
+Testing a group session needs ten boards. `mock_receiver.py` stands ten of them
+up in software and runs **instead of** `ble_sender.py`:
+
+```bash
+sudo systemctl stop aurmor-receiver
+sudo systemctl start aurmor-receiver-mock      # installed, not enabled
+journalctl -u aurmor-receiver-mock -f
+```
+
+Then on the phone: **New Group Session → "Use mock wearables" → Select
+devices**. Both halves are needed — the toggle invents the devices, this
+invents their data. Switch back with `stop aurmor-receiver-mock` and
+`start aurmor-receiver`; the two `Conflicts=`, since both claim the Bluetooth
+adapter and the UDP port.
+
+**Nothing on the data path is faked.** The real `UdpImuSource` and the real
+`BleSender` run unmodified, and the emulated boards genuinely send
+IMU/HELLO/ALERT packets over the loopback and genuinely answer WELCOME / MODE /
+FORGET / ALERT\_ACK. The only fiction is that ten boards exist. So the working
+modes (`idle` / `live` / `alerts` / `mock`), the impact ack-and-retransmit path,
+per-participant node attribution and the end-of-session release all behave as
+they do with hardware.
+
+The fleet occupies a **reserved wearable-id block, `0xE001`–`0xE00A`** — serials
+`aurmor-mibs-E001` … `aurmor-mibs-E00A`. The app mirrors that block in
+`features/devices/mock-devices.ts`; if you change `--wid-base` or `--count`, you
+must change it there too or the phone attributes samples to devices it never
+shows.
+
+Mock mode does **not** broadcast wearable presence in the advertisement. Ten live
+wids need 26 bytes of manufacturer data and only ~10 are free once Flags and the
+128-bit service UUID are in — BlueZ rejects an oversized advertisement outright,
+and a receiver that cannot advertise is invisible to every scan in the app, so
+there is nothing to pair and no session to start. Nothing is lost by skipping it:
+the app seeds the simulated fleet's wids itself. See **Presence advertisement
+sizing** below for the same limit on real hardware.
+
+Dry run on any host (no BLE, no config file, human-readable NDJSON):
+
+```bash
+python3 mock_receiver.py --stdout --mode live --count 3 --verbose
+python3 test_mock_receiver.py           # loopback tests, stdlib only
+```
+
+Flags: `--count` · `--wid-base` · `--mode` · `--period-ms` · `--impact-every` ·
+`--csv` · `--ap` · `--stdout` (see `python3 mock_receiver.py --help`). Boards
+start in `idle` like real hardware, so nothing streams until the session screen
+selects a mode.
+
+## Presence advertisement sizing
+
+The receiver names its live wearables in the manufacturer data of its BLE
+advertisement, so the app can show a provisioned (BLE-silent) ESP32 as detected
+without connecting. That advertisement is a **31-byte legacy payload and it is
+shared**:
+
+| AD structure | bytes |
+| --- | --- |
+| Flags | 3 |
+| Complete 128-bit Service UUID list | 18 |
+| manufacturer-data header (len, type, company id) | 4 |
+| our `[version, count]` | 2 |
+| **left for wids, at 2 bytes each** | **4 → two wids** |
+
+Go over 31 and BlueZ refuses to register the advertisement **at all** — the
+receiver then advertises nothing and disappears from the device picker, the
+presence scan and the session connection simultaneously. The symptom ("the app
+can't see the receiver") points nowhere near the presence code, which is why
+`protocol.PRESENCE_MAX_WIDS` is now *computed* from the table above rather than
+guessed, `test_udp_source.py` asserts the budget, and `publish()` retries without
+the presence data if BlueZ rejects it anyway.
+
+Because two wids is not a squad, the advertisement **rotates**: each refresh
+(`PRESENCE_REFRESH_MS`, 4 s) names the next slice, and the app holds a device
+present for `PRESENCE_TTL_MS` (25 s, `useKnownDeviceScan.ts`) — long enough for a
+full cycle, so a whole fleet still reads as detected. If you add anything to the
+advertisement, subtract it from `_ADV_FIXED_BYTES`; if you lengthen the rotation,
+check `refresh × slices` still fits comfortably inside the TTL.
+
 ## Verifying without the app
 
 On the Pi, run the sender, then on the phone use a generic BLE tool such as
@@ -267,9 +348,11 @@ the sender with `--stdout` on any host instead.)
 ```
 ble-sender/
 ├── ble_sender.py     # entry point: argparse, bluezero peripheral, GLib-driven replay
+├── mock_receiver.py  # ALTERNATIVE entry point: same receiver + 10 emulated wearables
 ├── replay.py         # CSV -> merged, time-ordered frames (no BLE deps)
 ├── protocol.py       # UUIDs, binary-v1 encode + framing + chunking (no BLE deps)
 ├── test_binary_protocol.py  # round-trip + upload-fidelity check (stdlib only)
+├── test_mock_receiver.py    # loopback tests for the emulated fleet (stdlib only)
 ├── requirements.txt
 └── README.md
 ```
